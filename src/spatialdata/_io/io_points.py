@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import zarr
@@ -12,6 +13,7 @@ from spatialdata._io._utils import (
     _write_metadata,
     overwrite_coordinate_transformations_non_raster,
 )
+from spatialdata._io.exceptions import WritingToZarrV2DeprecationWarning
 from spatialdata._io.format import CurrentPointsFormat, PointsFormats, _parse_version
 from spatialdata.models import get_axes_names
 from spatialdata.transformations._utils import (
@@ -24,7 +26,7 @@ def _read_points(
     store: str | Path,
 ) -> DaskDataFrame:
     """Read points from a zarr store."""
-    f = zarr.open(store, mode="r")
+    f = zarr.open(Path(store), mode="r")  # Path avoids zarr v3 URL-parsing special chars (e.g. #) in names
 
     version = _parse_version(f, expect_attrs_key=True)
     assert version is not None
@@ -65,8 +67,13 @@ def write_points(
     element_format
         The format of the points element used to store it.
     """
+    if element_format.zarr_format == 2:
+        warnings.warn(
+            message=WritingToZarrV2DeprecationWarning.message, category=WritingToZarrV2DeprecationWarning, stacklevel=2
+        )
     axes = get_axes_names(points)
     transformations = _get_transformations(points)
+    assert transformations is not None  # mypy: validate_element() in _write_element guarantees this
 
     store_root = group.store_path.store.root
     path = store_root / group.path / "points.parquet"
@@ -95,6 +102,4 @@ def write_points(
         axes=list(axes),
         attrs=attrs,
     )
-    if transformations is None:
-        raise ValueError(f"No transformations specified for element '{group.basename}'. Cannot write.")
     overwrite_coordinate_transformations_non_raster(group=group, axes=axes, transformations=transformations)

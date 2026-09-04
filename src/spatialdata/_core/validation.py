@@ -159,6 +159,8 @@ def check_all_keys_case_insensitively_unique(keys: Collection[str], location: tu
         exc_type=ValueError,
     ) as collect_error:
         for key in keys:
+            if key is None:
+                continue
             normalized_key = key.lower()
             with collect_error(location=location + (key,)):
                 check_key_is_case_insensitively_unique(key, seen)
@@ -256,6 +258,8 @@ def validate_table_attr_keys(data: AnnData, location: tuple[str, ...] = ()) -> N
             with collect_error(location=attr_path):
                 check_all_keys_case_insensitively_unique(getattr(data, attr).keys(), location=attr_path)
             for key in getattr(data, attr):
+                if key is None:
+                    continue
                 key_path = attr_path + (key,)
                 with collect_error(location=key_path):
                     if attr in ("obs", "var"):
@@ -393,7 +397,7 @@ class raise_validation_errors:
         # Exceptions were collected that we want to raise as a combined validation error.
         if self._collector.errors:
             raise ValidationError(
-                title=self._message + "\nTo fix, run `spatialdata.utils.sanitize_table(adata)`.",
+                title=self._message + "\nTo fix, run `spatialdata.sanitize_table(adata)`.",
                 errors=self._collector.errors,
             )
         return True

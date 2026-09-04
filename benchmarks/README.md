@@ -9,7 +9,7 @@ Note that to run code, your current working directory should be the SpatialData 
 The benchmarks use the [airspeed velocity](https://asv.readthedocs.io/en/stable/) (asv) framework. Install it with the `benchmark` option:
 
 ```
-pip install -e '.[docs,test,benchmark]'
+pip install -e . --group dev --group test --group docs --group benchmark
 ```
 
 ## Usage
@@ -42,6 +42,9 @@ asv continuous --show-stderr -v -b timeraw main faster-import
 
 Replace `faster-import` with any branch name or commit hash. The `-v` flag prints per-sample timings; drop it for a shorter summary.
 
+In case you see a lot of variation in the results, you could run with an additional option `-a rounds=<x>` where `<x>` in the number of rounds to run (default=2). E.g.: `-a rounds=10`.
+This will run 10 sets of benchmark runs for both commits, interleaving them, and show you the statistics of the results.
+
 Alternatively, collect results separately and compare afterwards:
 
 ```bash
@@ -63,6 +66,32 @@ asv run --python=same --show-stderr -b timeraw HEAD
 git checkout - && git stash pop
 
 asv compare main HEAD
+```
+
+### Dataloader benchmarks
+
+Dataloader benchmarks live in `benchmarks/benchmark_dataloader.py`. They use a synthetic in-memory `SpatialData` (2048×2048 image, 500 circle regions) and compute two metrics:
+
+- `time_init` — constructing `ImageTilesDataset` (includes bounding-box pre-computation).
+- `time_fetch` — iterating over all 500 tiles once (pure `__getitem__` calls, no `DataLoader` overhead).
+
+Run both in your current environment:
+
+```bash
+asv run --python=same --show-stderr -b TimeDataloader
+```
+
+Or a single method:
+
+```bash
+asv run --python=same --show-stderr -b TimeDataloader.time_init
+asv run --python=same --show-stderr -b TimeDataloader.time_fetch
+```
+
+Compare against `main` in one shot:
+
+```bash
+asv continuous --show-stderr -v -b TimeDataloader main HEAD
 ```
 
 ### Querying benchmarks

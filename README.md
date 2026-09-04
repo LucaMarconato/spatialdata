@@ -9,6 +9,16 @@
 >
 > **To use this template:** create a new branch from this one, and please name it `vibecoded-experiment/<name-of-your-experiment>` so it can be easily identified.
 
+## `sp-ops` experiment: round/t axes, relationships, RFC-8
+
+This experiment adds support for the [`sp-ops` optical-pooled-screening spec](https://github.com/scverse/sp-ops):
+`round`/`t` image axes, an `sp-ops:relationships` edge-list API, and an OME-NGFF RFC-8
+collection-node reader, plus a nested/truncated `SpatialData` repr. See
+[`examples/sp_ops/try_sp_ops_rfc8.py`](examples/sp_ops/try_sp_ops_rfc8.py) for a runnable
+demo against two real sp-ops-conformant stores, and
+[`examples/sp_ops/try_sp_ops_rfc8_output.txt`](examples/sp_ops/try_sp_ops_rfc8_output.txt)
+for its captured output.
+
 # SpatialData: an open and universal framework for processing spatial omics data.
 
 [![Tests][badge-tests]][link-tests]

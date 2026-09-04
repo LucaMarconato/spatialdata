@@ -130,6 +130,17 @@ packages = ['src/spatialdata']
 [tool.hatch.version]
 source = "vcs"
 
+# When this repo is installed as a `uv`/pip git dependency (e.g. from sp-ops's pyproject.toml,
+# pinned by commit), the fetching git backend does not always bring over tag refs, even for a
+# full (non-shallow) clone -- `git describe --tags` then finds nothing, and hatch-vcs/
+# setuptools-scm falls back to a "0.1.dev<N>+g<sha>" scheme with no tag as a base. That's well
+# below the `spatialdata>=0.7.2` floor real consumers like napari-spatialdata declare, so a
+# resolver silently downgrades to old, incompatible releases of them instead of erroring.
+# `fallback_version` (a setuptools-scm option, passed through by hatch-vcs) is used only in
+# that no-tags-visible case; a local dev checkout with normal tag access is unaffected.
+[tool.hatch.version.raw-options]
+fallback_version = "0.9.0"
+
 [tool.hatch.build.hooks.vcs]
 version-file = "_version.py"
 

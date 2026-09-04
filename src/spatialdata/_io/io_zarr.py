@@ -158,6 +158,12 @@ def read_zarr(
 
     resolved_store = _resolve_zarr_store(store)
     root_group = zarr.open_group(resolved_store, mode="r")
+
+    from spatialdata._io.io_collection import is_rfc8_collection_store, read_rfc8_zarr
+
+    if is_rfc8_collection_store(root_group):
+        return read_rfc8_zarr(root_group, root_group.store.root)
+
     # the following is the SpatialDataContainerFormat version
     if "spatialdata_attrs" not in root_group.metadata.attributes:
         # backward compatibility for pre-versioned SpatialData zarr stores

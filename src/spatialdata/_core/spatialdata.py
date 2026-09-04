@@ -13,7 +13,7 @@ import zarr
 from anndata import AnnData
 from annsel.core.typing import Predicates
 from dask.dataframe import DataFrame as DaskDataFrame
-from dask.dataframe import read_parquet
+from dask.dataframe import Scalar, read_parquet
 from geopandas import GeoDataFrame
 from shapely import MultiPolygon, Polygon
 from upath import UPath
@@ -106,7 +106,7 @@ class SpatialData:
         - the table are stored as :class:`anndata.AnnData` objects,  with the spatial coordinates stored in the obsm
             slot.
 
-    The table can annotate regions (shapesor labels) and can be used to store additional information.
+    The table can annotate regions (shapes or labels) and can be used to store additional information.
     Points are not regions but 0-dimensional locations. They can't be annotated by a table, but they can store
     annotation directly.
     """
@@ -667,12 +667,17 @@ class SpatialData:
                     continue
                 # each mode here requires paths or elements, using assert here to avoid mypy errors.
                 if by == "cs":
-                    from spatialdata._core.query.relational_query import (
-                        _filter_table_by_element_names,
-                    )
+                    from spatialdata._core.query.relational_query import _filter_table_by_elements
 
                     assert element_names is not None
-                    table = _filter_table_by_element_names(table, element_names)
+                    elements_dict = {}
+                    for element_type in ["images", "labels", "shapes", "points"]:
+                        elements = getattr(self, element_type)
+                        if elements:  # Check if the dictionary is not empty
+                            elements_dict[element_type] = {
+                                name: elements[name] for name in element_names if name in elements
+                            }
+                    table = _filter_table_by_elements(table, elements_dict=elements_dict)
                     if table is not None and len(table) != 0:
                         tables[table_name] = table
                 elif by == "elements":
@@ -1102,6 +1107,8 @@ class SpatialData:
         update_sdata_path: bool = True,
         sdata_formats: SpatialDataFormatType | list[SpatialDataFormatType] | None = None,
         shapes_geometry_encoding: Literal["WKB", "geoarrow"] | None = None,
+        raster_compressor: dict[Literal["lz4", "zstd"], int] | None = None,
+        convert_table_strings_to_categoricals: bool = False,
     ) -> None:
         """
         Write the `SpatialData` object to a Zarr store.
@@ -1149,11 +1156,20 @@ class SpatialData:
         shapes_geometry_encoding
             Whether to use the WKB or geoarrow encoding for GeoParquet. See :meth:`geopandas.GeoDataFrame.to_parquet`
             for details. If None, uses the value from :attr:`spatialdata.settings.shapes_geometry_encoding`.
+        raster_compressor
+            A lenght-1 dictionary with as key the type of compression to use for images and labels and as value the
+            compression level which should be inclusive between 0 and 9. For compression, `lz4` and `zstd` are
+            supported. If not specified, the compression will be `lz4` with compression level 5. Bytes are automatically
+            ordered for more efficient compression.
+        convert_table_strings_to_categoricals
+            If True, convert string columns of all tables to categoricals before writing.
+            Note that this will have a side effect of modifying string columns into categoricals in place.
         """
-        from spatialdata._io._utils import _resolve_zarr_store
+        from spatialdata._io._utils import _resolve_zarr_store, _validate_compressor_args
         from spatialdata._io.format import _parse_formats
 
         parsed = _parse_formats(sdata_formats)
+        _validate_compressor_args(raster_compressor)
 
         if isinstance(file_path, str):
             file_path = Path(file_path)
@@ -1175,6 +1191,8 @@ class SpatialData:
                 overwrite=False,
                 parsed_formats=parsed,
                 shapes_geometry_encoding=shapes_geometry_encoding,
+                raster_compressor=raster_compressor,
+                convert_table_strings_to_categoricals=convert_table_strings_to_categoricals,
             )
 
         if self.path != file_path and update_sdata_path:
@@ -1192,6 +1210,8 @@ class SpatialData:
         overwrite: bool,
         parsed_formats: dict[str, SpatialDataFormatType] | None = None,
         shapes_geometry_encoding: Literal["WKB", "geoarrow"] | None = None,
+        raster_compressor: dict[Literal["lz4", "zstd"], int] | None = None,
+        convert_table_strings_to_categoricals: bool = False,
     ) -> None:
         from spatialdata._io.io_zarr import _get_or_create_flat_element_group
 
@@ -1223,12 +1243,18 @@ class SpatialData:
         # leaf_name is the last path component (for labels/table writers that use name as group key)
         leaf_name = element_name.split("/")[-1]
 
+        if element_type != "tables":
+            from spatialdata.models import validate_element
+
+            validate_element(element)
+
         if element_type == "images":
             write_image(
                 image=element,
                 group=element_group,
                 name=leaf_name,
                 element_format=parsed_formats["raster"],
+                raster_compressor=raster_compressor,
             )
         elif element_type == "labels":
             # write_labels writes to group["labels"][name]; pass element_group as the "root"
@@ -1237,6 +1263,7 @@ class SpatialData:
                 group=element_group,
                 name=leaf_name,
                 element_format=parsed_formats["raster"],
+                raster_compressor=raster_compressor,
             )
         elif element_type == "points":
             write_points(
@@ -1259,6 +1286,7 @@ class SpatialData:
                 group=element_group.parent if element_group.name != "/" else element_group,
                 name=leaf_name,
                 element_format=parsed_formats["tables"],
+                convert_strings_to_categoricals=convert_table_strings_to_categoricals,
             )
         else:
             raise ValueError(f"Unknown element type: {element_type}")
@@ -1269,6 +1297,8 @@ class SpatialData:
         overwrite: bool = False,
         sdata_formats: SpatialDataFormatType | list[SpatialDataFormatType] | None = None,
         shapes_geometry_encoding: Literal["WKB", "geoarrow"] | None = None,
+        raster_compressor: dict[Literal["lz4", "zstd"], int] | None = None,
+        convert_table_strings_to_categoricals: bool = False,
     ) -> None:
         """
         Write a single element, or a list of elements, to the Zarr store used for backing.
@@ -1287,6 +1317,14 @@ class SpatialData:
         shapes_geometry_encoding
             Whether to use the WKB or geoarrow encoding for GeoParquet. See :meth:`geopandas.GeoDataFrame.to_parquet`
             for details. If None, uses the value from :attr:`spatialdata.settings.shapes_geometry_encoding`.
+        raster_compressor
+            A lenght-1 dictionary with as key the type of compression to use for images and labels and as value the
+            compression level which should be inclusive between 0 and 9. For compression, `lz4` and `zstd` are
+            supported. If not specified, the compression will be `lz4` with compression level 5. Bytes are automatically
+            ordered for more efficient compression.
+        convert_table_strings_to_categoricals
+            If True, and if element to be written is a table, convert string columns to categoricals before writing.
+            Note that this will have a side effect of modifying string columns into categoricals in place.
 
         Notes
         -----
@@ -1305,6 +1343,8 @@ class SpatialData:
                     overwrite=overwrite,
                     sdata_formats=sdata_formats,
                     shapes_geometry_encoding=shapes_geometry_encoding,
+                    raster_compressor=raster_compressor,
+                    convert_table_strings_to_categoricals=convert_table_strings_to_categoricals,
                 )
             return
 
@@ -1340,6 +1380,8 @@ class SpatialData:
             overwrite=overwrite,
             parsed_formats=parsed_formats,
             shapes_geometry_encoding=shapes_geometry_encoding,
+            raster_compressor=raster_compressor,
+            convert_table_strings_to_categoricals=convert_table_strings_to_categoricals,
         )
         # After every write, metadata should be consolidated, otherwise this can lead to IO problems like when deleting.
         if self.has_consolidated_metadata():
@@ -2036,6 +2078,31 @@ class SpatialData:
             if i < len(coordinate_systems) - 1:
                 descr += "\n"
 
+        from spatialdata._io._utils import get_dask_backing_files
+
+        def _element_path_to_element_name_with_type(element_path: str) -> str:
+            element_type, element_name = element_path.split("/")
+            return f"{element_name} ({element_type.capitalize()})"
+
+        if not self.is_self_contained():
+            assert self.path is not None
+            descr += "\nwith the following Dask-backed elements not being self-contained:"
+            description = self.elements_are_self_contained()
+            for _, element_name, element in self.gen_elements():
+                if not description[element_name]:
+                    backing_files_str = ", ".join(get_dask_backing_files(element))
+                    descr += f"\n    ▸ {element_name}: {backing_files_str}"
+
+        if self.path is not None:
+            elements_only_in_sdata, elements_only_in_zarr = self._symmetric_difference_with_zarr_store()
+            if len(elements_only_in_sdata) > 0:
+                descr += "\nwith the following elements not in the Zarr store:"
+                for element_path in elements_only_in_sdata:
+                    descr += f"\n    ▸ {_element_path_to_element_name_with_type(element_path)}"
+            if len(elements_only_in_zarr) > 0:
+                descr += "\nwith the following elements in the Zarr store but not in the SpatialData object:"
+                for element_path in elements_only_in_zarr:
+                    descr += f"\n    ▸ {_element_path_to_element_name_with_type(element_path)}"
         return descr
 
     def _gen_spatial_element_values(self) -> Generator[SpatialElement, None, None]:

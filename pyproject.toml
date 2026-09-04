@@ -15,7 +15,7 @@ maintainers = [
 urls.Documentation = "https://spatialdata.scverse.org/en/latest"
 urls.Source = "https://github.com/scverse/spatialdata.git"
 urls.Home-page = "https://github.com/scverse/spatialdata.git"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dynamic= [
   "version" # allow version to be set by git tags
 ]
@@ -26,8 +26,8 @@ dependencies = [
     "annsel>=0.1.2",
     "click",
     "dask-image",
-    "dask>=2025.12.0,<2026.1.2",
-    "distributed<2026.1.2",
+    "dask>=2026.3.0",
+    "distributed>=2026.3.0",
     "datashader",
     "fsspec[s3,http]",
     "geopandas>=0.14",
@@ -35,7 +35,7 @@ dependencies = [
     "networkx",
     "numba>=0.55.0",
     "numpy",
-    "ome_zarr>=0.14.0",
+    "ome_zarr>=0.16.0",
     "pandas",
     "pooch",
     "pyarrow",
@@ -45,6 +45,7 @@ dependencies = [
     "spatial_image>=1.2.3",
     "scikit-image",
     "scipy!=1.17.0",
+    "scverse-misc[datasets]>=0.1.0",
     "typing_extensions>=4.8.0",
     "universal_pathlib>=0.2.6",
     "xarray>=2024.10.0",
@@ -69,6 +70,7 @@ test = [
     "pytest",
     "pytest-cov",
     "pytest-mock",
+    "pytest-xdist",
     "torch",
 ]
 docs = [
@@ -79,6 +81,7 @@ docs = [
     "sphinxcontrib-bibtex>=1.0.0",
     "sphinx-autodoc-typehints",
     "sphinx-design",
+    "scanpydoc",
     # For notebooks
     "ipython>=8.6.0",
     "sphinx-copybutton",
@@ -102,10 +105,12 @@ strict = true
 addopts = [
     "--import-mode=importlib",  # allow using test files with same name
     "-s",  # print output from tests
+    "-p no:napari",  # napari registers a pytest plugin via its entry point; disable it here since spatialdata tests don't need it
 ]
 # These are all markers coming from xarray, dask or anndata. Added here to silence warnings.
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "network: marks tests that require network access; skipped by default, run with '--run-network'",
     "gpu: run test on GPU using CuPY.",
     "array_api: used by anndata.tests.helpers, not us",
     "skip_with_pyarrow_strings: skipwhen pyarrow string conversion is turned on",
@@ -143,7 +148,7 @@ exclude = [
 
 ]
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 ignore = [
@@ -208,3 +213,72 @@ convention = "numpy"
 
 # pyupgrade typing rewrite TODO: remove at some point from per-file ignore
 # "UP006", "UP007"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tool.pixi.dependencies]
+proj = "*"
+
+[tool.pixi.tasks]
+test = "pytest"
+test-parallel = "pytest -n auto --dist worksteal"
+pre-commit = "pre-commit run"
+pre-commit-all = "pre-commit run --all-files"
+
+[tool.pixi.feature.profiling.dependencies]
+py-spy = "*"
+
+[tool.pixi.feature.profiling.pypi-dependencies]
+spatialdata = { path = ".", editable = true }
+profimp = "*"
+memray = "*"
+
+[tool.pixi.feature.profiling.tasks]
+# Usage: pixi run -e profiling pyspy script.py  (prefix with sudo on macOS)
+pyspy = "py-spy record --gil -o profile.speedscope.json --format speedscope -- python"
+# Usage: pixi run -e profiling speedscope
+speedscope = "npx --yes speedscope profile.speedscope.json"
+# Usage: pixi run -e profiling memray-run script.py
+memray-run = "memray run"
+# Usage: pixi run -e profiling memray-flame memray-script.py.<pid>.bin
+memray-flame = "memray flamegraph --temporal"
+
+[tool.pixi.environments]
+profiling = { features = ["profiling"], solve-group = "default" }
+
+[tool.hatch.envs.test]
+dependency-groups = ["test"]
+
+[tool.hatch.envs.test-anndata-pandas]
+template = "test"
+extra-dependencies = ["zarr>=3"]
+scripts.test = ["pip list|grep anndata && pip list|grep pandas && pytest {args}"]
+scripts.test-readwrite = ["pip list|grep anndata && pip list|grep pandas && pytest tests/io/test_readwrite.py"]
+scripts.test-all = ["pip list|grep anndata && pip list|grep pandas && pytest ."]
+
+[[tool.hatch.envs.test-anndata-pandas.matrix]]
+anndata-pandas = [
+    "0.13-2",
+    "0.13-3",
+    "0.12-2"
+    # no "0.12-3": support for pandas>=3 is available only in anndata>=0.13
+]
+
+[tool.hatch.envs.test-anndata-pandas.overrides]
+matrix.anndata-pandas.extra-dependencies = [
+    # every option where the if-condition is True gets included
+
+    # anndata 0.13
+    {value="anndata~=0.13", if = ["0.13-2", "0.13-3"]},
+
+    # anndata 0.12
+    {value="anndata>=0.12,<0.13", if = ["0.12-2"]},
+
+    # pandas 2
+    {value="pandas>=2.3,<3", if = ["0.13-2", "0.12-2"]},
+
+    # pandas 3
+    {value="pandas~=3.0", if = ["0.13-3"]},
+]

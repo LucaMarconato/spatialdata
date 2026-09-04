@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import warnings
 from functools import singledispatch
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any
 
 import dask.dataframe as dd
 import geopandas
@@ -17,7 +17,7 @@ from spatialdata._logging import logger
 from spatialdata._utils import _check_match_length_channels_c_dim
 from spatialdata.transformations.transformations import BaseTransformation
 
-SpatialElement: TypeAlias = DataArray | DataTree | GeoDataFrame | DaskDataFrame
+type SpatialElement = DataArray | DataTree | GeoDataFrame | DaskDataFrame
 TRANSFORM_KEY = "transform"
 DEFAULT_COORDINATE_SYSTEM = "global"
 ValidAxis_t = str
@@ -172,6 +172,7 @@ def _(e: GeoDataFrame) -> tuple[str, ...]:
 
 
 @get_axes_names.register(DaskDataFrame)
+@get_axes_names.register(pd.DataFrame)
 def _(e: DaskDataFrame) -> tuple[str, ...]:
     valid_dims = (X, Y, Z)
     dims = tuple([c for c in valid_dims if c in e.columns])

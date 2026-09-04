@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from pathlib import Path
 from typing import Any, Literal
 
 import dask.dataframe.core
@@ -31,7 +32,7 @@ from spatialdata.models import (
 )
 from spatialdata.transformations import Identity
 
-__all__ = ["blobs", "raccoon"]
+__all__ = ["blobs", "cells", "raccoon"]
 
 
 def blobs(
@@ -77,6 +78,65 @@ def blobs(
 def raccoon() -> SpatialData:
     """Raccoon dataset."""
     return RaccoonDataset().raccoon()
+
+
+def _shipped_registry() -> tuple[str | None, dict[str, Any]]:
+    """Parse the ``datasets.yaml`` registry shipped inside the ``spatialdata`` package."""
+    import importlib.resources
+
+    from scverse_misc.datasets import parse_registry
+
+    registry = importlib.resources.files("spatialdata").joinpath("datasets.yaml")
+    with importlib.resources.as_file(registry) as registry_path:
+        base_url: str | None
+        datasets: dict[str, Any]
+        base_url, datasets = parse_registry(registry_path)
+    return base_url, datasets
+
+
+def _cache_dir(path: str | None) -> Path:
+    """Resolve the cache directory, defaulting to the OS cache location for ``"spatialdata"``."""
+    import pooch
+
+    return Path(path) if path is not None else Path(pooch.os_cache("spatialdata"))
+
+
+def cells(path: str | None = None) -> SpatialData:
+    """
+    Cells dataset.
+
+    Download the ``cells`` example dataset and load it as a :class:`~spatialdata.SpatialData`
+    object. The download is hash-verified and cached, so repeated calls reuse the local copy
+    instead of downloading again.
+
+    The dataset is a small region of a Xenium Prime Cervical Cancer sample and contains three
+    multiscale images (``he_aligned``, ``he_image``, ``morphology_focus``), three multiscale
+    label layers (``cell_labels``, ``nucleus_labels``, ``tissue_labels``), the ``transcripts``
+    points, the ``cell_boundaries`` and ``nucleus_boundaries`` shapes, and a cell-by-gene
+    ``table`` annotating the 94 cells.
+
+    Notes
+    -----
+    Derived from the 10x Genomics Xenium Prime Cervical Cancer FFPE dataset
+    (https://www.10xgenomics.com/datasets/xenium-prime-ffpe-human-cervical-cancer), subset to a
+    small tissue region. Licensed under `CC BY 4.0 <https://creativecommons.org/licenses/by/4.0/>`_;
+    see ``datasets.yaml`` for the attribution string shipped alongside the data.
+
+    Parameters
+    ----------
+    path
+        Directory in which to cache the downloaded data. If `None`, the default OS cache
+        location is used (:func:`pooch.os_cache` for ``"spatialdata"``).
+
+    Returns
+    -------
+    SpatialData object with the cells dataset.
+    """
+    from scverse_misc.datasets import fetch
+
+    base_url, datasets = _shipped_registry()
+    sdata: SpatialData = fetch(datasets["cells"], _cache_dir(path), base_url=base_url)
+    return sdata
 
 
 class RaccoonDataset:
@@ -397,7 +457,10 @@ def blobs_annotating_element(name: BlobsTypes) -> SpatialData:
         index = sdata[name].index
         instance_id = index.compute().tolist() if isinstance(index, dask.dataframe.Index) else index.tolist()
     n = len(instance_id)
-    new_table = AnnData(shape=(n, 0), obs={"region": pd.Categorical([name] * n), "instance_id": instance_id})
+    obs_df = pd.DataFrame(
+        {"region": pd.Categorical([name] * n), "instance_id": instance_id}, index=[str(i) for i in range(n)]
+    )
+    new_table = AnnData(shape=(n, 0), obs=obs_df)
     new_table = TableModel.parse(new_table, region=name, region_key="region", instance_key="instance_id")
     del sdata.tables["table"]
     sdata["table"] = new_table

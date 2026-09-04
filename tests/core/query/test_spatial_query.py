@@ -265,7 +265,7 @@ def test_query_raster(
         shape = (10,) + shape
     shape = (n_channels,) + shape if not is_labels else (1,) + shape
 
-    image = np.zeros(shape)
+    image = np.zeros(shape, dtype=int if is_labels else float)
     axes = ["y", "x"]
     if is_3d:
         image[:, 2:7, 5::, 0:5] = 1
@@ -674,6 +674,253 @@ def test_query_points_multiple_partitions(points, with_polygon_query: bool):
     q0 = _query(p0)
     q1 = _query(p1)
     assert np.array_equal(q0.index.compute(), q1.index.compute())
+
+
+def test_query_points_multiple_boxes_in_transformed_coordinate_system():
+    from spatialdata.transformations import Affine
+
+    points_element = _make_points(np.array([[10, 10], [20, 30], [20, 30], [40, 50]]))
+    set_transformation(
+        points_element,
+        transformation=Affine(
+            np.array([[1, 0, 100], [0, 1, -50], [0, 0, 1]]),
+            input_axes=("x", "y"),
+            output_axes=("x", "y"),
+        ),
+        to_coordinate_system="aligned",
+    )
+
+    points_result = bounding_box_query(
+        points_element,
+        axes=("x", "y"),
+        min_coordinate=np.array([[118, -22], [138, -2], [200, 200]]),
+        max_coordinate=np.array([[122, -18], [142, 2], [210, 210]]),
+        target_coordinate_system="aligned",
+    )
+
+    np.testing.assert_allclose(points_result[0]["x"].compute(), [20, 20])
+    np.testing.assert_allclose(points_result[0]["y"].compute(), [30, 30])
+    np.testing.assert_allclose(points_result[1]["x"].compute(), [40])
+    np.testing.assert_allclose(points_result[1]["y"].compute(), [50])
+    assert points_result[2] is None
+
+
+def test_query_points_bounding_box_in_transformed_coordinate_system():
+    from spatialdata.transformations import Affine
+
+    # Points: A(3,3), B(9,3), C(8,3)
+    points_element = _make_points(np.array([[3, 3], [9, 3], [8, 3]]))
+
+    # Transformation: rotate 45°, then translate (-3√2, -3√2)
+    # Combined affine matrix T @ R:
+    #   A(3,3) → (-3√2,  0  )
+    #   B(9,3) → ( 0,    3√2)
+    #   C(8,3) → (-√2/2, 5√2/2)
+    s = np.sqrt(2) / 2
+    t = -3 * np.sqrt(2)
+    set_transformation(
+        points_element,
+        transformation=Affine(
+            np.array([[s, -s, t], [s, s, t], [0, 0, 1]]),
+            input_axes=("x", "y"),
+            output_axes=("x", "y"),
+        ),
+        to_coordinate_system="aligned",
+    )
+
+    # Query box in aligned space: x ∈ [-10, 10], y ∈ [5√2/2 ± 0.5]
+    # Only C maps into this box (y ≈ 3.54 vs B y ≈ 4.24 which is just above).
+    y_center = 5 * np.sqrt(2) / 2
+    result = bounding_box_query(
+        points_element,
+        axes=("x", "y"),
+        min_coordinate=np.array([-10.0, y_center - 0.5]),
+        max_coordinate=np.array([10.0, y_center + 0.5]),
+        target_coordinate_system="aligned",
+    )
+
+    np.testing.assert_allclose(result["x"].compute(), [8])
+    np.testing.assert_allclose(result["y"].compute(), [3])
+
+
+def test_query_points_bounding_box_negative_scale_transform():
+    """Regression test: negative-scale (axis-flip) transforms must not raise ValueError.
+
+    Before the fix the scaling path raised ValueError instead of swapping the
+    inverted interval back to min < max after inverting through the negative scale.
+    """
+    from spatialdata.transformations import Affine
+
+    # Points (1, 0) and (5, 0). Under x-flip: (1,0)→(−1,0), (5,0)→(−5,0).
+    points_element = _make_points(np.array([[1, 0], [5, 0]]))
+    set_transformation(
+        points_element,
+        transformation=Affine(
+            np.array([[-1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float),
+            input_axes=("x", "y"),
+            output_axes=("x", "y"),
+        ),
+        to_coordinate_system="aligned",
+    )
+
+    # Query aligned x ∈ (−2, 0), y ∈ (−1, 1) → only (1, 0) maps to (−1, 0) which is inside.
+    result = bounding_box_query(
+        points_element,
+        axes=("x", "y"),
+        min_coordinate=np.array([-2.0, -1.0]),
+        max_coordinate=np.array([0.0, 1.0]),
+        target_coordinate_system="aligned",
+    )
+
+    np.testing.assert_allclose(result["x"].compute(), [1])
+    np.testing.assert_allclose(result["y"].compute(), [0])
+
+
+@pytest.mark.parametrize("scales", [(1, 1), (1.1, 1), (0.5, 2), (1.1, -1.2)])
+def test_query_points_3d_bounding_box_axes_order_independent(scales):
+    """Regression test for https://github.com/scverse/spatialdata/issues/1175.
+
+    For 3D points with a non-trivial Scale transformation (i.e. not scale by x=1, y=1) defined only on ("x", "y"),
+    querying with a bounding box should give the same result regardless of the order in which the axes are passed,
+    e.g. axes=("x", "y") vs. axes=("y", "x") (with min/max coordinates permuted accordingly).
+
+    - The bug does not occur if we drop the z coordinate.
+    - The bug does not occur if the scale is Scale([1, 1], axes=("x", "y"))
+
+    """
+    from spatialdata.transformations import Scale
+
+    coordinates = np.array(
+        [
+            [10.0, 10.0, 1.0],
+            [70.0, 30.0, 2.0],
+            [100.0, 50.0, 3.0],
+            [150.0, 70.0, 4.0],
+            [220.0, 90.0, 5.0],
+            [10.0, -10.0, 1.0],
+            [70.0, -30.0, 2.0],
+            [100.0, -50.0, 3.0],
+            [150.0, -70.0, 4.0],
+            [220.0, -90.0, 5.0],
+        ]
+    )
+    points_element = _make_points(coordinates)
+    scale_x, scale_y = scales
+    scale = Scale([scale_x, scale_y], axes=("x", "y"))
+    set_transformation(points_element, transformation=scale, to_coordinate_system="global")
+
+    x_min, x_max = 60.0, 240.0
+    y_min, y_max = 20.0, 160.0
+
+    result_xy = bounding_box_query(
+        points_element,
+        axes=("x", "y"),
+        min_coordinate=[x_min, y_min],
+        max_coordinate=[x_max, y_max],
+        target_coordinate_system="global",
+    )
+    result_yx = bounding_box_query(
+        points_element,
+        axes=("y", "x"),
+        min_coordinate=[y_min, x_min],
+        max_coordinate=[y_max, x_max],
+        target_coordinate_system="global",
+    )
+
+    n_xy = 0 if result_xy is None else len(result_xy)
+    n_yx = 0 if result_yx is None else len(result_yx)
+    assert n_xy == n_yx
+
+    # Uncomment to visualize the two queries side by side (requires spatialdata_plot, matplotlib).
+    # This code also writes the plot to a file in the OS's temporary directory and
+    # throws a warning to print the path where the file was written.
+
+    # import matplotlib.pyplot as plt
+    # import spatialdata_plot  # noqa: F401
+    # from matplotlib.patches import Rectangle
+
+    # from spatialdata import SpatialData
+
+    # has_z = "z" in points_element.columns
+    # bug_occurred = n_xy != n_yx
+    # fig_title = (
+    #     f"z={'yes' if has_z else 'no'}, scale=({scale_x}, {scale_y}), "
+    #     f"bug={'YES' if bug_occurred else 'no'} (n_xy={n_xy}, n_yx={n_yx})"
+    # )
+
+    # sdata_3d = SpatialData(points={"transcripts": points_element})
+    # fig, axes_ = plt.subplots(1, 2, figsize=(15, 8))
+    # fig.suptitle(fig_title)
+    # for i, (qaxes, mn, mx) in enumerate(
+    #     [
+    #         (["x", "y"], [x_min, y_min], [x_max, y_max]),
+    #         (["y", "x"], [y_min, x_min], [y_max, x_max]),
+    #     ]
+    # ):
+    #     r = sdata_3d.query.bounding_box(
+    #         axes=qaxes,
+    #         min_coordinate=mn,
+    #         max_coordinate=mx,
+    #         target_coordinate_system="global",
+    #     )
+    #     # n = len(r["transcripts"]) if "transcripts" in r.points else "element dropped"
+    #     # print(f"axes={str(qaxes):14s} -> {n}")
+    #     subplot_title = f"querying by axes={tuple(qaxes)}"
+    #     sdata_3d.pl.render_points("transcripts", color="red", size=10).pl.show(
+    #         ax=axes_[i], colorbar=False, legend_loc=None, title=subplot_title
+    #     )
+    #     r.pl.render_points("transcripts", color="green", size=10).pl.show(
+    #         ax=axes_[i], colorbar=False, legend_loc=None, title=subplot_title
+    #     )
+
+    #     # fake points to get legend entries
+    #     axes_[i].plot([], [], "ro", ms=10, label="points NOT selected by query")
+    #     axes_[i].plot([], [], "go", ms=10, label="points selected by query")
+
+    #     # the intended box, in (x, y) order
+    #     axes_[i].add_patch(
+    #         Rectangle(
+    #             (x_min, y_min),
+    #             x_max - x_min,
+    #             y_max - y_min,
+    #             fill=False,
+    #             edgecolor="red",
+    #             linewidth=0.5,
+    #             label="bounding box (x, y)",
+    #         )
+    #     )
+    #     # the same box with x/y intervals swapped, i.e. what a buggy (y, x) query could effectively select
+    #     axes_[i].add_patch(
+    #         Rectangle(
+    #             (y_min, x_min),
+    #             y_max - y_min,
+    #             x_max - x_min,
+    #             fill=False,
+    #             edgecolor="blue",
+    #             linestyle="--",
+    #             linewidth=0.5,
+    #             label="flipped (y, x) box",
+    #         )
+    #     )
+    #     axes_[i].legend(loc="lower right")
+    #     axes_[i].set_xlim(
+    #         points_element["x"].min().compute().item() * scale_x - 20,
+    #         points_element["x"].max().compute().item() * scale_x + 20,
+    #     )
+    #     axes_[i].set_ylim(
+    #         points_element["y"].min().compute().item() * scale_y - 20,
+    #         points_element["y"].max().compute().item() * scale_y + 20,
+    #     )
+    # plt.tight_layout()
+    # # plt.show()
+    # import warnings
+    # from tempfile import mkdtemp
+    # import pathlib as pl
+
+    # tmpdir_path = pl.Path(mkdtemp())
+    # filename = tmpdir_path / f"iss1175_scalex_{scale_x}_scaley_{scale_y}.png"
+    # fig.savefig(filename, dpi=300)
+    # warnings.warn(f"Figure saved to {filename}")
 
 
 @pytest.mark.parametrize("with_polygon_query", [True, False])

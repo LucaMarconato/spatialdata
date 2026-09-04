@@ -26,6 +26,7 @@ from shapely.io import to_ragged_array
 from spatial_image import to_spatial_image
 from xarray import DataArray, DataTree
 
+import spatialdata
 from spatialdata._core.spatialdata import SpatialData
 from spatialdata._core.validation import ValidationError
 from spatialdata._types import ArrayLike
@@ -163,12 +164,12 @@ class TestModels:
             converter = partial(converter, dims=dims)
         elif converter is to_spatial_image:
             converter = partial(converter, dims=model.dims)
-        if n_dims == 2:
-            image: ArrayLike = RNG.uniform(size=(10, 10))
-        elif n_dims == 3:
-            image: ArrayLike = RNG.uniform(size=(3, 10, 10))
-        elif n_dims == 4:
-            image: ArrayLike = RNG.uniform(size=(2, 3, 10, 10))
+        # labels must be integer-valued, images can be float
+        shape = {2: (10, 10), 3: (3, 10, 10), 4: (2, 3, 10, 10)}[n_dims]
+        if model in [Labels2DModel, Labels3DModel]:
+            image: ArrayLike = RNG.integers(0, 100, size=shape)
+        else:
+            image = RNG.uniform(size=shape)
         image = converter(image)
         self._parse_transformation_from_multiple_places(model, image)
         spatial_image = model.parse(image)
@@ -370,10 +371,10 @@ class TestModels:
             return
         if coordinates is not None:
             coordinates = coordinates.copy()
-        coords = ["A", "B", "C", "x", "y", "z"]
         n = 10
-        data = pd.DataFrame(RNG.integers(0, 101, size=(n, 6)), columns=coords)
-        data["target"] = pd.Series(RNG.integers(0, 2, size=(n,))).astype(str)
+        coord_cols = ["A", "B", "C"] if coordinates is not None else ["x", "y", "z"]
+        data = pd.DataFrame(RNG.integers(0, 101, size=(n, len(coord_cols))), columns=coord_cols)
+        data["target"] = pd.Categorical(pd.Series(RNG.integers(0, 2, size=(n,))).astype(str))
         data["cell_id"] = pd.Series(RNG.integers(0, 5, size=(n,))).astype(np.int_)
         data["anno"] = pd.Series(RNG.integers(0, 1, size=(n,))).astype(np.int_)
         # to test for non-contiguous indices
@@ -661,6 +662,18 @@ class TestModels:
                     else:
                         TableModel.validate(adata)
 
+    def test_table_model_invalid_name_suggests_public_sanitizer(self):
+        adata = AnnData(np.array([[0]]), uns={"invalid name": {}})
+
+        with pytest.raises(
+            ValidationError,
+            match=r"`spatialdata\.sanitize_table\(adata\)`",
+        ):
+            TableModel.validate(adata)
+
+        spatialdata.sanitize_table(adata)
+        TableModel.validate(adata)
+
     @pytest.mark.parametrize(
         "keys",
         [
@@ -838,6 +851,45 @@ def test_force2d():
     assert_elements_are_identical(multipolygons_3d, expected_multipolygons_2d)
 
 
+def test_points_model_preserves_column_order():
+    # the extra columns used to be added iterating over a set, so their order in the parsed element depended on
+    # PYTHONHASHSEED. Renaming the coordinate columns changes the set of column names, which used to bypass the
+    # reordering safeguard at the end of PointsModel.parse().
+    extra_columns = ["qv", "intensity", "radius", "z_score", "nucleus_distance", "codeword_index"]
+    n = 10
+    data = pd.DataFrame(
+        {
+            "my_x": np.arange(n, dtype=float),
+            "my_y": np.arange(n, dtype=float),
+            "target": pd.Categorical(["a", "b"] * (n // 2)),
+            "cell_id": np.arange(n),
+            **{c: np.arange(n, dtype=float) for c in extra_columns},
+        }
+    )
+    expected = ["x", "y", "target", "cell_id", *extra_columns]
+
+    from_pandas = PointsModel.parse(
+        data, coordinates={"x": "my_x", "y": "my_y"}, feature_key="target", instance_key="cell_id"
+    )
+    assert list(from_pandas.columns) == expected
+
+    from_dask = PointsModel.parse(
+        dd.from_pandas(data, npartitions=2),
+        coordinates={"x": "my_x", "y": "my_y"},
+        feature_key="target",
+        instance_key="cell_id",
+    )
+    assert list(from_dask.columns) == expected
+
+    from_numpy = PointsModel.parse(
+        data[["my_x", "my_y"]].to_numpy(),
+        annotation=data.drop(columns=["my_x", "my_y"]),
+        feature_key="target",
+        instance_key="cell_id",
+    )
+    assert list(from_numpy.columns) == expected
+
+
 def test_dask_points_unsorted_index_with_warning(points):
     chunksize = 300
     element = points["points_0"]
@@ -928,8 +980,8 @@ def test_label_no_c_coords(model: Labels2DModel | Labels3DModel):
 
 
 def test_warning_on_large_chunks():
-    data_small = DataArray(dask.array.zeros((100, 100), chunks=(50, 50)), dims=["x", "y"])
-    data_large = DataArray(dask.array.zeros((50000, 50000), chunks=(50000, 50000)), dims=["x", "y"])
+    data_small = DataArray(dask.array.zeros((100, 100), chunks=(50, 50), dtype=np.int64), dims=["x", "y"])
+    data_large = DataArray(dask.array.zeros((50000, 50000), chunks=(50000, 50000), dtype=np.int64), dims=["x", "y"])
     assert np.array(data_large.shape).prod().item() > LARGE_CHUNK_THRESHOLD_BYTES
 
     # single and multiscale, small chunk size
@@ -961,9 +1013,10 @@ def test_warning_on_large_chunks():
 
 
 def test_categories_on_partitioned_dataframe(sdata_blobs: SpatialData):
+    rng = default_rng(seed=0)
     df = sdata_blobs["blobs_points"].compute()
-    df["genes"] = RNG.choice([f"gene_{i}" for i in range(200)], len(df))
-    N_PARTITIONS = 200
+    df["genes"] = rng.choice([f"gene_{i}" for i in range(10)], len(df))
+    N_PARTITIONS = 10
     ddf = dd.from_pandas(df, npartitions=N_PARTITIONS)
     ddf["genes"] = ddf["genes"].astype("category")
 

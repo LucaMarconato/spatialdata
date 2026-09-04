@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal, TypeGuard
+from typing import Any, Literal, TypeGuard, cast
 
 import dask.array as da
 import numpy as np
@@ -20,15 +21,16 @@ from xarray import DataArray, DataTree
 
 from spatialdata._io._utils import (
     _get_transformations_from_ngff_dict,
+    overwrite_channel_names,
     overwrite_coordinate_transformations_raster,
 )
+from spatialdata._io.exceptions import WritingToZarrV2DeprecationWarning
 from spatialdata._io.format import (
     CurrentRasterFormat,
     RasterFormatType,
     get_ome_zarr_format,
 )
 from spatialdata._utils import get_pyramid_levels
-from spatialdata.models._utils import get_channel_names
 from spatialdata.models.models import ATTRS_KEY
 from spatialdata.models.pyramids_utils import dask_arrays_to_datatree
 from spatialdata.transformations._utils import (
@@ -265,6 +267,7 @@ def _write_raster(
     name: str,
     raster_format: RasterFormatType,
     storage_options: JSONDict | list[JSONDict] | None = None,
+    raster_compressor: dict[Literal["lz4", "zstd"], int] | None = None,
     label_metadata: JSONDict | None = None,
     **metadata: str | JSONDict | list[JSONDict],
 ) -> None:
@@ -284,6 +287,8 @@ def _write_raster(
         The format used to write the raster data.
     storage_options
         Additional options for writing the raster data, like chunks and compression.
+    raster_compressor
+        Compression settings as a len-1 dictionary with a single key-value {compression: compression level} pair
     label_metadata
         Label metadata which can only be defined when writing 'labels'.
     metadata
@@ -298,13 +303,6 @@ def _write_raster(
         metadata["name"] = name
         metadata["label_metadata"] = label_metadata
 
-    # convert channel names to channel metadata in omero
-    if raster_type == "image":
-        metadata["metadata"] = {"omero": {"channels": []}}
-        channels = get_channel_names(raster_data)
-        for c in channels:
-            metadata["metadata"]["omero"]["channels"].append({"label": c})  # type: ignore[union-attr, index, call-overload]
-
     if isinstance(raster_data, DataArray):
         _write_raster_dataarray(
             raster_type,
@@ -313,22 +311,27 @@ def _write_raster(
             raster_data,
             raster_format,
             storage_options,
+            raster_compressor=raster_compressor,
             **metadata,
         )
     elif isinstance(raster_data, DataTree):
-        _write_raster_datatree(
+        group = _write_raster_datatree(
             raster_type,
             group,
             name,
             raster_data,
             raster_format,
             storage_options,
+            raster_compressor=raster_compressor,
             **metadata,
         )
     else:
         raise ValueError("Not a valid labels object")
 
     group = group["labels"][name] if raster_type == "labels" else group
+    if raster_type == "image":
+        # ome-zarr-py >= 0.18 no longer writes the omero channel metadata, so we write it ourselves.
+        overwrite_channel_names(group, raster_data)
     if ATTRS_KEY not in group.attrs:
         group.attrs[ATTRS_KEY] = {}
     attrs = group.attrs[ATTRS_KEY]
@@ -337,13 +340,93 @@ def _write_raster(
     group.attrs[ATTRS_KEY] = attrs
 
 
+def _build_v3_codec(
+    compression: Literal["lz4", "zstd"],
+    compression_level: int,
+) -> Any:
+    """Return the appropriate zarr v3 codec for the given compression type and level."""
+    if compression == "zstd":
+        from zarr.codecs import ZstdCodec
+
+        return ZstdCodec(level=compression_level)
+    # lz4: use the native zarr v3 BloscCodec
+    from zarr.codecs import BloscCodec
+
+    return BloscCodec(cname="lz4", clevel=compression_level)
+
+
+def _apply_compression(
+    storage_options: JSONDict | list[JSONDict],
+    raster_compressor: dict[Literal["lz4", "zstd"], int] | None,
+    zarr_format: Literal[2, 3] = 3,
+) -> JSONDict | list[JSONDict]:
+    """Apply compression settings to storage options.
+
+    Parameters
+    ----------
+    storage_options
+        Storage options for zarr arrays
+    raster_compressor
+        Compression settings as a dictionary with a single key-value pair
+    zarr_format
+        The zarr format version (2 or 3)
+
+    Returns
+    -------
+    Updated storage options with compression settings
+    """
+    if not raster_compressor:
+        return storage_options
+
+    ((compression, compression_level),) = raster_compressor.items()
+
+    if zarr_format == 2:
+        from numcodecs import Blosc as BloscV2
+
+        codec_v2 = BloscV2(cname=compression, clevel=compression_level, shuffle=1)
+
+        def _update_dict(d: dict[str, Any]) -> None:
+            d["compressor"] = codec_v2
+
+        if isinstance(storage_options, dict):
+            _update_dict(d=storage_options)
+        elif isinstance(storage_options, list):
+            for option in storage_options:
+                _update_dict(d=option)
+        elif storage_options is None:
+            return {"compressor": codec_v2}
+        else:
+            raise ValueError(f"storage_options must be a dict or list, not {type(storage_options)}")
+    else:
+        # zarr v3: use native codec objects via the "compressors" (plural) key.
+        # see  https://github.com/ome/ome-zarr-py/blob/v0.16.0/ome_zarr/writer.py#L754
+        # ome-zarr-py ≥ 0.16.0 with dask ≥ 2026.3.0 forwards this key to zarr_array_kwargs.
+        codec_v3 = _build_v3_codec(compression, compression_level)
+
+        def _update_dict_v3(d: dict[str, Any]) -> None:
+            d["compressors"] = [codec_v3]
+
+        if isinstance(storage_options, dict):
+            _update_dict_v3(d=storage_options)
+        elif isinstance(storage_options, list):
+            for option in storage_options:
+                _update_dict_v3(d=option)
+        elif storage_options is None:
+            return {"compressors": [codec_v3]}
+        else:
+            raise ValueError(f"storage_options must be a dict or list, not {type(storage_options)}")
+
+    return storage_options
+
+
 def _write_raster_dataarray(
     raster_type: Literal["image", "labels"],
     group: zarr.Group,
     element_name: str,
     raster_data: DataArray,
     raster_format: RasterFormatType,
-    storage_options: JSONDict | list[JSONDict] | None = None,
+    storage_options: JSONDict | list[JSONDict] | None,
+    raster_compressor: dict[Literal["lz4", "zstd"], int] | None,
     **metadata: str | JSONDict | list[JSONDict],
 ) -> None:
     """Write raster data of type DataArray to disk.
@@ -362,6 +445,8 @@ def _write_raster_dataarray(
         The format used to write the raster data.
     storage_options
         Additional options for writing the raster data, like chunks and compression.
+    raster_compressor
+        Compression settings as a len-1 dictionary with a single key-value {compression: compression level} pair
     metadata
         Additional metadata for the raster element
     """
@@ -369,11 +454,15 @@ def _write_raster_dataarray(
 
     data = raster_data.data
     transformations = _get_transformations(raster_data)
-    if transformations is None:
-        raise ValueError(f"{element_name} does not have any transformations and can therefore not be written.")
+    assert transformations is not None  # mypy: validate_element() in _write_element guarantees this
     input_axes: tuple[str, ...] = tuple(raster_data.dims)
     parsed_axes = _get_valid_axes(axes=list(input_axes), fmt=raster_format)
     storage_options = _prepare_storage_options(storage_options)
+    # Apply compression if specified
+    storage_options = _apply_compression(
+        storage_options, raster_compressor, zarr_format=cast(Literal[2, 3], raster_format.zarr_format)
+    )
+
     # Explicitly disable pyramid generation for single-scale rasters. Recent ome-zarr versions default
     # write_image()/write_labels() to scale_factors=(2, 4, 8, 16), which would otherwise write s0, s1, ...
     # even when the input is a plain DataArray.
@@ -407,9 +496,10 @@ def _write_raster_datatree(
     element_name: str,
     raster_data: DataTree,
     raster_format: RasterFormatType,
-    storage_options: JSONDict | list[JSONDict] | None = None,
+    storage_options: JSONDict | list[JSONDict] | None,
+    raster_compressor: dict[Literal["lz4", "zstd"], int] | None,
     **metadata: str | JSONDict | list[JSONDict],
-) -> None:
+) -> zarr.Group:
     """Write raster data of type DataTree to disk.
 
     Parameters
@@ -426,6 +516,8 @@ def _write_raster_datatree(
         The format used to write the raster data.
     storage_options
         Additional options for writing the raster data, like chunks and compression.
+    raster_compressor
+        Compression settings as a len-1 dictionary with a single key-value {compression: compression level} pair
     metadata
         Additional metadata for the raster element
     """
@@ -439,11 +531,14 @@ def _write_raster_datatree(
     assert len(d) == 1
     xdata = d.values().__iter__().__next__()
     transformations = _get_transformations_xarray(xdata)
-    if transformations is None:
-        raise ValueError(f"{element_name} does not have any transformations and can therefore not be written.")
+    assert transformations is not None  # mypy: validate_element() in _write_element guarantees this
 
     parsed_axes = _get_valid_axes(axes=list(input_axes), fmt=raster_format)
     storage_options = _prepare_storage_options(storage_options)
+
+    # Apply compression if specified
+    storage_options = _apply_compression(storage_options, raster_compressor, zarr_format=raster_format.zarr_format)
+
     ome_zarr_format = get_ome_zarr_format(raster_format)
     dask_delayed = write_multi_scale_ngff(
         pyramid=data,
@@ -460,6 +555,15 @@ def _write_raster_datatree(
     # os.replace is called. These can also be alleviated by using 'single-threaded' scheduler.
     da.compute(*dask_delayed, optimize_graph=False)
 
+    # Workaround for https://github.com/scverse/spatialdata/issues/1024.
+    # ome-zarr-py bundles write_multiscales_metadata() as a dask.delayed task in the compute=False
+    # code path (see https://github.com/ome/ome-zarr-py/issues/580). When da.compute() runs with
+    # the 'processes' scheduler that task executes in a subprocess: the on-disk zarr.json is written
+    # correctly, but the zarr.Group held in this process keeps its original in-memory GroupMetadata
+    # and never sees the update. Re-opening the group forces a fresh read from the store.
+    # This workaround should not be needed once https://github.com/ome/ome-zarr-py/issues/580 is fixed.
+    group = zarr.open_group(store=group.store, path=group.path, mode="r+", use_consolidated=False)
+
     trans_group = group["labels"][element_name] if raster_type == "labels" else group
     overwrite_coordinate_transformations_raster(
         group=trans_group,
@@ -467,6 +571,7 @@ def _write_raster_datatree(
         axes=tuple(input_axes),
         raster_format=raster_format,
     )
+    return group
 
 
 def write_image(
@@ -475,8 +580,14 @@ def write_image(
     name: str,
     element_format: RasterFormatType = CurrentRasterFormat(),
     storage_options: JSONDict | list[JSONDict] | None = None,
+    raster_compressor: dict[Literal["lz4", "zstd"], int] | None = None,
     **metadata: str | JSONDict | list[JSONDict],
 ) -> None:
+    if element_format.zarr_format == 2:
+        warnings.warn(
+            message=WritingToZarrV2DeprecationWarning.message, category=WritingToZarrV2DeprecationWarning, stacklevel=2
+        )
+
     _write_raster(
         raster_type="image",
         raster_data=image,
@@ -484,6 +595,7 @@ def write_image(
         name=name,
         raster_format=element_format,
         storage_options=storage_options,
+        raster_compressor=raster_compressor,
         **metadata,
     )
 
@@ -495,8 +607,14 @@ def write_labels(
     element_format: RasterFormatType = CurrentRasterFormat(),
     storage_options: JSONDict | list[JSONDict] | None = None,
     label_metadata: JSONDict | None = None,
+    raster_compressor: dict[Literal["lz4", "zstd"], int] | None = None,
     **metadata: JSONDict,
 ) -> None:
+    if element_format.zarr_format == 2:
+        warnings.warn(
+            message=WritingToZarrV2DeprecationWarning.message, category=WritingToZarrV2DeprecationWarning, stacklevel=2
+        )
+
     _write_raster(
         raster_type="labels",
         raster_data=labels,
@@ -504,6 +622,7 @@ def write_labels(
         name=name,
         raster_format=element_format,
         storage_options=storage_options,
+        raster_compressor=raster_compressor,
         label_metadata=label_metadata,
         **metadata,
     )

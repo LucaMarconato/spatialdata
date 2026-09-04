@@ -19,12 +19,13 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - {os: windows-latest, python: "3.11", dask-version: "2025.12.0", name: "Dask 2025.12.0"}
-                    - {os: windows-latest, python: "3.13", dask-version: "latest", name: "Dask latest"}
-                    - {os: ubuntu-latest, python: "3.11", dask-version: "latest", name: "Dask latest"}
-                    - {os: ubuntu-latest, python: "3.13", dask-version: "latest", name: "Dask latest"}
-                    - {os: macos-latest, python: "3.11", dask-version: "latest", name: "Dask latest"}
-                    - {os: macos-latest, python: "3.13", prerelease: "allow", name: "Python 3.13 (pre-release)"}
+                    - {os: windows-latest, python: "3.12", dask-version: "2026.3.0", name: "min dask"}
+                    - {os: windows-latest, python: "3.14", dask-version: "latest"}
+                    - {os: ubuntu-latest, python: "3.12", dask-version: "latest"}
+                    - {os: ubuntu-latest, python: "3.13", dask-version: "latest"}
+                    - {os: ubuntu-latest, python: "3.14", dask-version: "latest"}
+                    - {os: macos-latest, python: "3.12", dask-version: "latest"}
+                    - {os: macos-latest, python: "3.14", prerelease: "allow", name: "prerelease"}
         env:
             OS: ${{ matrix.os }}
             PYTHON: ${{ matrix.python }}
@@ -41,7 +42,6 @@ jobs:
             - name: Install dependencies
               run: |
                   if [[ "${PRERELEASE}" == "allow" ]]; then
-                    sed -i '' 's/requires-python.*//' pyproject.toml # otherwise uv complains that anndata requires python>=3.12 and we only do >=3.11 😱
                     uv add git+https://github.com/scverse/anndata.git
                     uv add pandas>=3.dev0
                   fi
@@ -59,11 +59,12 @@ jobs:
                   PLATFORM: ${{ matrix.os }}
                   DISPLAY: :42
               run: |
-                  uv run pytest --cov --color=yes --cov-report=xml
+                  uv run pytest --run-network --cov --color=yes --cov-report=xml -n auto --dist worksteal
             - name: Upload coverage to Codecov
-              uses: codecov/codecov-action@v5
+              uses: codecov/codecov-action@v6
               with:
                   name: coverage
                   verbose: true
+                  fail_ci_if_error: true
               env:
                   CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

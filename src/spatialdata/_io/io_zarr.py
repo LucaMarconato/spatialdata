@@ -5,7 +5,7 @@ import warnings
 from collections.abc import Callable
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import zarr
 import zarr.storage
@@ -72,7 +72,7 @@ def _read_zarr_group_spatialdata_element(
                         reader_format = get_raster_format_for_read(elem_group, sdata_version)
                         element = read_func(
                             elem_group_path,
-                            cast(Literal["image", "labels"], element_type),
+                            element_type,
                             reader_format,
                         )
                     elif element_type in ["shapes", "points", "tables"]:
@@ -137,7 +137,7 @@ def read_zarr(
         Path, URL, or zarr.Group to the zarr store (on-disk or remote).
 
     selection
-        List of elements to read from the zarr store (images, labels, points, shapes, table). If None, all elements are
+        List of elements to read from the zarr store (images, labels, points, shapes, tables). If None, all elements are
         read.
 
     on_bad_files

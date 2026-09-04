@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,6 +16,7 @@ from spatialdata._io._utils import (
     _write_metadata,
     overwrite_coordinate_transformations_non_raster,
 )
+from spatialdata._io.exceptions import WritingToZarrV2DeprecationWarning
 from spatialdata._io.format import (
     CurrentShapesFormat,
     ShapesFormats,
@@ -34,7 +36,7 @@ def _read_shapes(
     store: str | Path,
 ) -> GeoDataFrame:
     """Read shapes from a zarr store."""
-    f = zarr.open(store, mode="r")
+    f = zarr.open(Path(store), mode="r")  # Path avoids zarr v3 URL-parsing special chars (e.g. #) in names
     version = _parse_version(f, expect_attrs_key=True)
     assert version is not None
     shape_format = ShapesFormats[version]
@@ -93,6 +95,11 @@ def write_shapes(
         Whether to use the WKB or geoarrow encoding for GeoParquet. See :meth:`geopandas.GeoDataFrame.to_parquet` for
         details. If None, uses the value from :attr:`spatialdata.settings.shapes_geometry_encoding`.
     """
+    if element_format.zarr_format == 2:
+        warnings.warn(
+            message=WritingToZarrV2DeprecationWarning.message, category=WritingToZarrV2DeprecationWarning, stacklevel=2
+        )
+
     from spatialdata.config import settings
 
     if geometry_encoding is None:
@@ -100,8 +107,7 @@ def write_shapes(
 
     axes = get_axes_names(shapes)
     transformations = _get_transformations(shapes)
-    if transformations is None:
-        raise ValueError(f"{group.basename} does not have any transformations and can therefore not be written.")
+    assert transformations is not None  # mypy: validate_element() in _write_element guarantees this
     if isinstance(element_format, ShapesFormatV01):
         attrs = _write_shapes_v01(shapes, group, element_format)
     elif isinstance(element_format, ShapesFormatV02 | ShapesFormatV03):

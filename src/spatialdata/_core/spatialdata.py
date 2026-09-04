@@ -1035,6 +1035,8 @@ class SpatialData:
         A list of paths of the elements saved in the Zarr store.
         """
         from spatialdata._io._utils import _resolve_zarr_store
+        from spatialdata._io.io_collection import is_rfc8_collection_store
+        from spatialdata._io.io_zarr import _scan_for_elements
 
         if self.path is None:
             raise ValueError("The SpatialData object is not backed by a Zarr store.")
@@ -1043,18 +1045,24 @@ class SpatialData:
         root = zarr.open_group(store=store, mode="r")
         elements_in_zarr = []
 
-        def find_groups(obj: zarr.Group, path: str) -> None:
-            # with the current implementation, a path of a zarr group is the path for an element if and only if its
-            # string representation contains exactly one "/"
-            if isinstance(obj, zarr.Group) and path.count("/") == 1:
-                elements_in_zarr.append(path)
+        if is_rfc8_collection_store(root):
+            # RFC-8 collection stores nest elements at arbitrary depth under sp-ops:* attributes,
+            # not under a fixed images/labels/points/shapes/tables root -- there is no lightweight
+            # scan for them yet (short of a full read_rfc8_zarr). Rather than falsely reporting
+            # every in-memory element as missing, report no difference for this layout.
+            store.close()
+            return self.elements_paths_in_memory()
 
         for element_type in root:
             if element_type in ["images", "labels", "points", "shapes", "tables"]:
                 for element_name in root[element_type]:
                     path = f"{element_type}/{element_name}"
                     elements_in_zarr.append(path)
-        # root.visit(lambda path: find_groups(root[path], path))
+
+        # v0.3 flat layout: elements are identified by spatialdata_attrs.element_type, at any depth
+        for element_name, (element_type, _abs_path) in _scan_for_elements(root, str(self.path)).items():
+            elements_in_zarr.append(f"{element_type}/{element_name}")
+
         store.close()
         return elements_in_zarr
 
@@ -2118,7 +2126,9 @@ class SpatialData:
         from spatialdata._io._utils import get_dask_backing_files
 
         def _element_path_to_element_name_with_type(element_path: str) -> str:
-            element_type, element_name = element_path.split("/")
+            # element_name may itself contain "/" under the flat/hierarchical layout, so only
+            # the leading "element_type" segment is split off
+            element_type, element_name = element_path.split("/", 1)
             return f"{element_name} ({element_type.capitalize()})"
 
         if not self.is_self_contained():

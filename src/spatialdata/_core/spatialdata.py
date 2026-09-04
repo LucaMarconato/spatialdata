@@ -58,6 +58,58 @@ if TYPE_CHECKING:
     )
 
 
+# number of siblings shown at each level of the repr's element/coordinate-system trees before
+# collapsing the rest into a single "... N more" line: 4 or more siblings triggers truncation,
+# showing the first 2 and collapsing the rest (e.g. 4 channels -> channel0, channel1, ... 2 more)
+_REPR_TREE_MAX_CHILDREN_SHOWN = 2
+
+
+def _insert_into_tree(tree: dict[str, Any], parts: list[str], leaf_value: str) -> None:
+    """Insert a `/`-split path into a nested dict, with dict subtrees for folders and str leaves."""
+    key = parts[0]
+    if len(parts) == 1:
+        tree[key] = leaf_value
+        return
+    subtree = tree.setdefault(key, {})
+    if not isinstance(subtree, dict):
+        # a leaf and a folder can't share the same path in practice (each is a distinct Zarr
+        # group); fall back to treating it as a folder rather than raising, to keep repr robust
+        subtree = {}
+        tree[key] = subtree
+    _insert_into_tree(subtree, parts[1:], leaf_value)
+
+
+def _render_tree(tree: dict[str, Any], indent: str = "") -> list[str]:
+    """Render a nested dict (from `_insert_into_tree`) as `├──`/`└──` lines, truncating long sibling lists."""
+    from spatialdata._utils import _natural_keys
+
+    keys = sorted(tree.keys(), key=_natural_keys)
+    total = len(keys)
+    truncated = total > _REPR_TREE_MAX_CHILDREN_SHOWN + 1
+    shown_keys = keys[:_REPR_TREE_MAX_CHILDREN_SHOWN] if truncated else keys
+    n_rows = len(shown_keys) + (1 if truncated else 0)
+
+    lines: list[str] = []
+    for i, key in enumerate(shown_keys):
+        is_last = i == n_rows - 1
+        branch = "└──" if is_last else "├──"
+        child_indent = indent + ("    " if is_last else "│   ")
+        value = tree[key]
+        if isinstance(value, dict):
+            n_children = len(value)
+            lines.append(f"{indent}{branch} {key}/ ({n_children} element{'s' if n_children != 1 else ''})")
+            lines.extend(_render_tree(value, child_indent))
+        else:
+            suffix = f": {value}" if value else ""
+            lines.append(f"{indent}{branch} {key}{suffix}")
+
+    if truncated:
+        remaining = total - _REPR_TREE_MAX_CHILDREN_SHOWN
+        lines.append(f"{indent}└── ... {remaining} more")
+
+    return lines
+
+
 class SpatialData:
     """
     The SpatialData object.
@@ -1982,8 +2034,6 @@ class SpatialData:
         -------
             The string representation of the SpatialData object.
         """
-        from collections import defaultdict
-
         from spatialdata._utils import _natural_keys
         from spatialdata.transformations.operations import get_transformation
 
@@ -2035,37 +2085,17 @@ class SpatialData:
         if self.path is not None:
             descr += f" at {self.path.resolve()}"
 
-        # Split elements: flat (no "/") vs grouped by first path component
-        tree: dict[str, list[tuple[str, Any]]] = defaultdict(list)
-        flat: list[tuple[str, Any]] = []
+        # Build a nested tree from the `/`-joined element names, so a name like "a/b/c" becomes
+        # a folder "a" containing a folder "b" containing the leaf "c" (see _insert_into_tree),
+        # and render it with long sibling lists collapsed (see _render_tree).
+        elements_tree: dict[str, Any] = {}
+        for name, elem in self._elements.items():
+            _insert_into_tree(elements_tree, name.split("/"), _format_element(name, elem))
 
-        for name, elem in sorted(self._elements.items(), key=lambda x: _natural_keys(x[0])):
-            parts = name.split("/", 1)
-            if len(parts) == 1:
-                flat.append((name, elem))
-            else:
-                tree[parts[0]].append((parts[1], elem))
+        for line in _render_tree(elements_tree):
+            descr += f"\n{line}"
 
-        # Build ordered list of entries: flat elements first, then grouped
-        folder_keys = sorted(tree.keys(), key=_natural_keys)
-        all_entries: list[tuple[str, Any]] = flat + [(k, tree[k]) for k in folder_keys]
-
-        for i, entry in enumerate(all_entries):
-            is_last = i == len(all_entries) - 1
-            branch = "└──" if is_last else "├──"
-            child_indent = "    " if is_last else "│   "
-
-            if isinstance(entry[1], list):
-                folder, children = entry[0], entry[1]
-                descr += f"\n{branch} {folder}/ ({len(children)} element{'s' if len(children) != 1 else ''})"
-                for j, (child_name, child_elem) in enumerate(children):
-                    child_branch = "└──" if j == len(children) - 1 else "├──"
-                    descr += f"\n{child_indent}{child_branch} {child_name}: {_format_element(child_name, child_elem)}"
-            else:
-                name, elem = entry
-                descr += f"\n{branch} {name}: {_format_element(name, elem)}"
-
-        # Coordinate systems
+        # Coordinate systems: same hierarchy + truncation, applied to the elements in each system
         descr += "\nwith coordinate systems:\n"
         coordinate_systems = sorted(self.coordinate_systems, key=_natural_keys)
         for i, cs in enumerate(coordinate_systems):
@@ -2077,7 +2107,11 @@ class SpatialData:
                 if cs in transformations:
                     elements_in_cs.append(element_name)
             if elements_in_cs:
-                descr += f", with elements:\n        {', '.join(sorted(elements_in_cs, key=_natural_keys))}"
+                cs_tree: dict[str, Any] = {}
+                for element_name in elements_in_cs:
+                    _insert_into_tree(cs_tree, element_name.split("/"), "")
+                descr += ", with elements:\n"
+                descr += "\n".join(f"        {line}" for line in _render_tree(cs_tree))
             if i < len(coordinate_systems) - 1:
                 descr += "\n"
 

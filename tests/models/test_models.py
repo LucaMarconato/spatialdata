@@ -193,6 +193,43 @@ class TestModels:
             with pytest.raises(ValueError):
                 model.parse(image, **kwargs)
 
+    @pytest.mark.parametrize("extra_dims", [("round",), ("t",), ("round", "t")])
+    @pytest.mark.parametrize("model", [Image2DModel, Image3DModel])
+    def test_raster_schema_with_round_and_t_axes(self, model: RasterSchema, extra_dims: tuple[str, ...]) -> None:
+        """Images may be prefixed by `round` and/or `t`, in that fixed order (sp-ops spec decision D6)."""
+        core_shape = (3, 10, 10) if model is Image2DModel else (3, 2, 10, 10)
+        shape = tuple(4 for _ in extra_dims) + core_shape
+        dims = extra_dims + model.dims
+        image: ArrayLike = RNG.uniform(size=shape)
+
+        spatial_image = model.parse(image, dims=dims)
+        assert spatial_image.dims == dims
+        for extra_dim in extra_dims:
+            np.testing.assert_array_equal(spatial_image.coords[extra_dim].values, np.arange(4))
+
+        if extra_dims == ("round", "t"):
+            # the OME-Zarr writer requires a "t" axis to be the very first dimension (ome_zarr.axes.Axes,
+            # "'time' axis must be first dimension only"), so a store with both "round" and "t" (which, per D6,
+            # orders "round" before "t") cannot be written; the model layer itself (construction, selection,
+            # transformation) is unaffected and is still exercised below.
+            pass
+        else:
+            # a round-trip through zarr I/O preserves the axes and validates
+            self._passes_validation_after_io(model, spatial_image, "image")
+
+        # selecting by the extra axes works, as in the specification's reader example
+        selection = spatial_image
+        for extra_dim in extra_dims:
+            selection = selection.sel({extra_dim: 0})
+        assert selection.shape == core_shape
+
+        # applying a transformation does not raise (covers `BaseTransformation._get_n_spatial_dims`)
+        set_transformation(spatial_image, Identity(), "global")
+        from spatialdata import transform
+
+        transformed = transform(spatial_image, to_coordinate_system="global")
+        assert transformed.dims == dims
+
     @pytest.mark.parametrize(
         "model,chunks,expected",
         [

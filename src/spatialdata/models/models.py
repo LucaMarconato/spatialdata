@@ -31,7 +31,7 @@ from spatialdata._logging import logger
 from spatialdata._types import ArrayLike
 from spatialdata._utils import _check_match_length_channels_c_dim
 from spatialdata.config import settings
-from spatialdata.models import C, X, Y, Z, get_axes_names
+from spatialdata.models import C, ROUND, T, X, Y, Z, get_axes_names
 from spatialdata.models._utils import (
     DEFAULT_COORDINATE_SYSTEM,
     TRANSFORM_KEY,
@@ -78,12 +78,42 @@ def _parse_transformations(element: SpatialElement, transformations: MappingToCo
     _set_transformations(element, parsed_transformations)
 
 
+def _build_dataarray_with_extra_axes(
+    data: DaskArray, dims: tuple[str, ...], c_coords: list[str] | None
+) -> DataArray:
+    """Construct a DataArray for `dims` containing a `round` axis, which `to_spatial_image` cannot handle.
+
+    Mirrors the coordinate conventions `to_spatial_image` uses for the dims it does support: integer coordinates
+    for `c` (or the given `c_coords`) and for `round`/`t`, float pixel-index coordinates for `z`/`y`/`x` (these are
+    later overwritten by `compute_coordinates`).
+    """
+    coords: dict[str, Any] = {}
+    for i, d in enumerate(dims):
+        n = data.shape[i]
+        if d == C:
+            coords[d] = list(c_coords) if c_coords is not None else list(range(n))
+        elif d in (ROUND, T):
+            coords[d] = np.arange(n)
+        else:
+            coords[d] = np.arange(n, dtype=np.float64)
+    return DataArray(data, dims=dims, coords=coords)
+
+
 class RasterSchema:
     """Base schema for raster data."""
 
     # TODO add DataTree validation, validate has scale0... etc and each scale contains 1 image in .variables.
     ATTRS_KEY = ATTRS_KEY
     dims: tuple[str, ...]
+    # axes that may prefix `dims` (in this fixed order), not part of the model's core spatial/channel axes;
+    # see the sp-ops specification's D6 decision ("axes are a subset of round, t, c, z, y, x in that order")
+    _EXTRA_AXES = (ROUND, T)
+
+    @classmethod
+    def _full_dims(cls, dims: tuple[str, ...]) -> tuple[str, ...]:
+        """`cls.dims` prefixed by whichever of `_EXTRA_AXES` are present in `dims`, in fixed order."""
+        extra = tuple(ax for ax in cls._EXTRA_AXES if ax in dims)
+        return extra + cls.dims
 
     @classmethod
     def parse(
@@ -185,9 +215,10 @@ class RasterSchema:
                     )
             else:
                 dims = data.dims
-            # but if dims don't match the model's dims, throw error
-            if set(dims).symmetric_difference(cls.dims):
-                raise ValueError(f"Wrong `dims`: {dims}. Expected {cls.dims}.")
+            # but if dims don't match the model's dims (plus any recognized `round`/`t` prefix), throw error
+            full_dims = cls._full_dims(dims)
+            if set(dims).symmetric_difference(full_dims):
+                raise ValueError(f"Wrong `dims`: {dims}. Expected {full_dims}.")
             _reindex = lambda d: d
         # if there are no dims in the data, use the model's dims or provided dims
         elif isinstance(data, np.ndarray | DaskArray):
@@ -195,20 +226,22 @@ class RasterSchema:
                 data = from_array(data)
             if dims is None:
                 dims = cls.dims
+                full_dims = cls.dims
             else:
-                if len(set(dims).symmetric_difference(cls.dims)) > 0:
-                    raise ValueError(f"Wrong `dims`: {dims}. Expected {cls.dims}.")
+                full_dims = cls._full_dims(dims)
+                if len(set(dims).symmetric_difference(full_dims)) > 0:
+                    raise ValueError(f"Wrong `dims`: {dims}. Expected {full_dims}.")
             _reindex = lambda d: dims.index(d)
         else:
             raise ValueError(f"Unsupported data type: {type(data)}.")
 
         # transpose if possible
-        if tuple(dims) != cls.dims:
+        if tuple(dims) != full_dims:
             try:
                 if isinstance(data, DataArray):
-                    data = data.transpose(*list(cls.dims))
+                    data = data.transpose(*list(full_dims))
                 elif isinstance(data, DaskArray):
-                    data = data.transpose(*[_reindex(d) for d in cls.dims])
+                    data = data.transpose(*[_reindex(d) for d in full_dims])
                 else:
                     raise ValueError(f"Unsupported data type: {type(data)}.")
             except ValueError as e:
@@ -219,15 +252,23 @@ class RasterSchema:
 
         # finally convert to spatial image
         if c_coords is not None:
-            c_coords = _check_match_length_channels_c_dim(data, c_coords, cls.dims)
+            c_coords = _check_match_length_channels_c_dim(data, c_coords, full_dims)
 
-        if c_coords is not None and len(c_coords) != data.shape[cls.dims.index("c")]:
+        if c_coords is not None and len(c_coords) != data.shape[full_dims.index("c")]:
             raise ValueError(
                 f"The number of channel names `{len(c_coords)}` does not match the length of dimension 'c'"
-                f" with length {data.shape[cls.dims.index('c')]}."
+                f" with length {data.shape[full_dims.index('c')]}."
             )
 
-        data = to_spatial_image(array_like=data, dims=cls.dims, c_coords=c_coords, **kwargs)
+        if ROUND in full_dims:
+            # the external `spatial_image` package's `to_spatial_image` has no notion of a `round` axis (unlike
+            # `t`, which it already supports), so build the DataArray directly for this case. `to_spatial_image`
+            # itself returns a plain `xarray.DataArray` (see `spatial_image.SpatialImageDataClass.new`), so this
+            # mirrors its behavior for the dims it does support; kwargs such as `rgb`/`scale`/`translation` that
+            # `to_spatial_image` would otherwise handle are not supported here.
+            data = _build_dataarray_with_extra_axes(data, full_dims, c_coords)
+        else:
+            data = to_spatial_image(array_like=data, dims=full_dims, c_coords=c_coords, **kwargs)
         # parse transformations
         _parse_transformations(data, transformations)
         # convert to multiscale if needed
@@ -323,9 +364,10 @@ class RasterSchema:
 
     @classmethod
     def _validate_dims(cls, data: DataArray) -> None:
-        if len(data.dims) != len(cls.dims):
-            raise ValueError(f"Expected {len(cls.dims)} dimensions, got {len(data.dims)}: {data.dims}")
-        for expected, actual in zip(cls.dims, data.dims, strict=True):
+        full_dims = cls._full_dims(data.dims)
+        if len(data.dims) != len(full_dims):
+            raise ValueError(f"Expected {len(full_dims)} dimensions, got {len(data.dims)}: {data.dims}")
+        for expected, actual in zip(full_dims, data.dims, strict=True):
             if expected != actual:
                 raise ValueError(f"Expected dimension '{expected}', got '{actual}'")
 

@@ -67,6 +67,30 @@ def test_identity():
         Identity().to_affine_matrix(input_axes=("x", "y", "c"), output_axes=("x", "y"))
 
 
+@pytest.mark.parametrize(
+    "axes,expected",
+    [
+        (("c", "z", "y", "x"), 3),
+        (("c", "y", "x"), 2),
+        (("z", "y", "x"), 3),
+        (("y", "x"), 2),
+        # "round"/"t" (used by rasters with a repeated-round or elapsed-time axis, see spatialdata.models) are
+        # non-spatial and do not change the spatial dimensionality of the axes they prefix
+        (("round", "c", "z", "y", "x"), 3),
+        (("round", "c", "y", "x"), 2),
+        (("t", "c", "y", "x"), 2),
+        (("round", "t", "c", "y", "x"), 2),
+    ],
+)
+def test_get_n_spatial_dims(axes: tuple[str, ...], expected: int) -> None:
+    assert Identity()._get_n_spatial_dims(axes) == expected
+
+
+def test_get_n_spatial_dims_invalid():
+    with pytest.raises(ValueError):
+        Identity()._get_n_spatial_dims(("round", "x"))
+
+
 def test_map_axis():
     # map_axis0 behaves like an identity
     map_axis0 = MapAxis({"x": "x", "y": "y"})

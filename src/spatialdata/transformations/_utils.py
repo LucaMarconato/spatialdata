@@ -202,6 +202,8 @@ def _(data: DataArray) -> DataArray:
     coords: dict[str, ArrayLike] = {
         d: np.arange(data.sizes[d], dtype=np.float64) + 0.5 for d in data.sizes if d in ["x", "y", "z"]
     }
+    # "round"/"t" are integer-indexed (not pixel-center offset), so `.sel(round=0)` addresses the first slice
+    coords.update({d: np.arange(data.sizes[d]) for d in data.sizes if d in ["round", "t"]})
     return data.assign_coords(coords)
 
 
@@ -209,7 +211,9 @@ def _(data: DataArray) -> DataArray:
 def _(data: DataTree) -> DataTree:
     from spatialdata.models import get_axes_names
 
-    spatial_coords = [ax for ax in get_axes_names(data) if ax in ["x", "y", "z"]]
+    axes_names = get_axes_names(data)
+    spatial_coords = [ax for ax in axes_names if ax in ["x", "y", "z"]]
+    extra_coords = [ax for ax in axes_names if ax in ["round", "t"]]
     img_name = list(data["scale0"].data_vars.keys())[0]
     out = {}
     for name, dt in data.items():
@@ -220,6 +224,8 @@ def _(data: DataTree) -> DataTree:
             offset = max_dim / n / 2
             coords = np.linspace(0, max_dim, n + 1)[:-1] + offset
             new_coords[ax] = coords
+        for ax in extra_coords:
+            new_coords[ax] = np.arange(dt.sizes[ax])
 
         # Xarray now only accepts Dataset as dictionary values for DataTree.from_dict.
         out[name] = Dataset({img_name: dt[img_name].assign_coords(new_coords)})

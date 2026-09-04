@@ -26,6 +26,11 @@ C = "c"
 Z = "z"
 Y = "y"
 X = "x"
+ROUND = "round"
+T = "t"
+# non-spatial, non-channel axes that may prefix the core (c)(z)y(x) axes of a raster element, in this fixed order
+# (see the sp-ops specification's D6 decision: "axes are a subset of round, t, c, z, y, x in that order")
+_EXTRA_AXES_ORDER = (ROUND, T)
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -78,9 +83,9 @@ def validate_axis_name(axis: ValidAxis_t) -> None:
     Raises
     ------
     TypeError
-        If the axis name not in ["c", "x", "y", "z"]
+        If the axis name not in ["c", "x", "y", "z", "round", "t"]
     """
-    if axis not in ["c", "x", "y", "z"]:
+    if axis not in ["c", "x", "y", "z", ROUND, T]:
         raise TypeError(f"Invalid axis: {axis}")
 
 
@@ -179,11 +184,18 @@ def _(e: DaskDataFrame) -> tuple[str, ...]:
     return dims
 
 
+_CORE_DIMS = frozenset({(X,), (Y,), (Z,), (C,), (X, Y), (X, Y, Z), (Y, X), (Z, Y, X), (C, Y, X), (C, Z, Y, X)})
+
+
 def _validate_dims(dims: tuple[str, ...]) -> None:
     for c in dims:
-        if c not in (X, Y, Z, C):
+        if c not in (X, Y, Z, C, ROUND, T):
             raise ValueError(f"Invalid dimension: {c}")
-    if dims not in [(X,), (Y,), (Z,), (C,), (X, Y), (X, Y, Z), (Y, X), (Z, Y, X), (C, Y, X), (C, Z, Y, X)]:
+    # `round`/`t` may prefix one of the known core dims tuples, in the fixed order given by `_EXTRA_AXES_ORDER`
+    # (they never replace or reorder the core axes, see D6 of the sp-ops specification)
+    extra = tuple(ax for ax in _EXTRA_AXES_ORDER if ax in dims)
+    core = tuple(ax for ax in dims if ax not in _EXTRA_AXES_ORDER)
+    if core not in _CORE_DIMS or tuple(dims) != extra + core:
         raise ValueError(f"Invalid dimensions: {dims}")
 
 
@@ -359,12 +371,13 @@ def get_raster_model_from_data_dims(dims: tuple[str, ...]) -> type[RasterSchema]
     """
     from spatialdata.models.models import Image2DModel, Image3DModel, Labels2DModel, Labels3DModel
 
-    if not set(dims).issubset({C, Z, Y, X}):
+    if not set(dims).issubset({C, Z, Y, X, ROUND, T}):
         raise ValueError(f"Invalid dimensions: {dims}")
 
-    if C in dims:
-        return Image3DModel if Z in dims else Image2DModel
-    return Labels3DModel if Z in dims else Labels2DModel
+    core = tuple(ax for ax in dims if ax not in _EXTRA_AXES_ORDER)
+    if C in core:
+        return Image3DModel if Z in core else Image2DModel
+    return Labels3DModel if Z in core else Labels2DModel
 
 
 def convert_region_column_to_categorical(table: AnnData) -> None:

@@ -21,6 +21,7 @@ from xarray import DataArray, DataTree
 from zarr.errors import GroupNotFoundError
 
 from spatialdata._core._elements import Images, Labels, Points, Shapes, Tables
+from spatialdata._core.relationships import Relationships
 from spatialdata._core.validation import (
     check_all_keys_case_insensitively_unique,
     check_target_region_column_symmetry,
@@ -120,10 +121,12 @@ class SpatialData:
         shapes: dict[str, GeoDataFrame] | None = None,
         tables: dict[str, AnnData] | Tables | None = None,
         attrs: Mapping[Any, Any] | None = None,
+        relationships: Relationships | None = None,
     ) -> None:
         self._path: Path | None = None
         self._elements: dict[str, SpatialElement | AnnData] = {}
         self.attrs = attrs if attrs else {}  # type: ignore[assignment]
+        self.relationships = relationships if relationships is not None else Relationships()
 
         # Build elements from typed dicts for backward compatibility
         if elements is None:
@@ -2429,6 +2432,23 @@ class SpatialData:
             self._attrs = value
         else:
             self._attrs = dict(value)
+
+    @property
+    def relationships(self) -> Relationships:
+        """
+        Edge list of relationships between elements of this SpatialData object (sp-ops A6/D9).
+
+        This is a generic, in-memory alternative to (or complement of) the ``region``/
+        ``region_key``/``instance_key`` table annotation triple. It is not (yet) persisted to
+        or read from a Zarr store.
+        """
+        return self._relationships
+
+    @relationships.setter
+    def relationships(self, value: Relationships) -> None:
+        if not isinstance(value, Relationships):
+            raise TypeError(f"relationships must be a Relationships object, got {type(value)}.")
+        self._relationships = value
 
     def filter_by_table_query(
         self,

@@ -202,9 +202,12 @@ class BaseTransformation(ABC):
 
     def _get_n_spatial_dims(self, axes: tuple[str, ...]) -> int:
         valid_axes = {("c", "z", "y", "x"): 3, ("c", "y", "x"): 2, ("z", "y", "x"): 3, ("y", "x"): 2}
-        if axes not in valid_axes:
+        # "round"/"t" (a raster axis prefix defined outside this module, see spatialdata.models) are non-spatial and
+        # may optionally prefix any of the axes tuples above without changing the spatial dimensionality
+        core_axes = tuple(ax for ax in axes if ax not in ("round", "t"))
+        if core_axes not in valid_axes:
             raise ValueError(f"Invalid axes: {axes}")
-        return valid_axes[axes]
+        return valid_axes[core_axes]
 
     @abstractmethod
     def __eq__(self, other: Any) -> bool:

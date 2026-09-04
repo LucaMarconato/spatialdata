@@ -42,20 +42,23 @@ def _transform_raster(
     from spatialdata.transformations.transformations import Sequence, Translation
 
     n_spatial_dims = transformation._get_n_spatial_dims(axes)
+    # every non-spatial axis (e.g. "c", and, for a raster with a "round"/"t" axis, that axis too) is a leading axis
+    # by construction (see the fixed axis order in `spatialdata.models.models.RasterSchema`): it is left untouched
+    # by the transformation, like "c" already was before "round"/"t" existed.
+    n_leading = len(axes) - n_spatial_dims
     binary: ArrayLike = np.array(list(itertools.product([0, 1], repeat=n_spatial_dims)))
     spatial_shape = data.shape[len(data.shape) - n_spatial_dims :]
     binary *= np.array(spatial_shape)
-    c_channel = [np.zeros(len(binary)).reshape((-1, 1))] if "c" in axes else []
-    v: ArrayLike = np.hstack(c_channel + [binary, np.ones(len(binary)).reshape((-1, 1))])
+    leading_columns = [np.zeros(len(binary)).reshape((-1, 1))] * n_leading
+    v: ArrayLike = np.hstack(leading_columns + [binary, np.ones(len(binary)).reshape((-1, 1))])
     matrix = transformation.to_affine_matrix(input_axes=axes, output_axes=axes)
     inverse_matrix = transformation.inverse().to_affine_matrix(input_axes=axes, output_axes=axes)
     new_v: ArrayLike = (matrix @ v.T).T
-    c_shape: tuple[int, ...]
-    c_shape = (data.shape[0],) if "c" in axes else ()
+    leading_shape: tuple[int, ...] = data.shape[:n_leading]
     new_spatial_shape = tuple(
-        int(np.max(new_v[:, i]) - np.min(new_v[:, i])) for i in range(len(c_shape), n_spatial_dims + len(c_shape))
+        int(np.max(new_v[:, i]) - np.min(new_v[:, i])) for i in range(n_leading, n_spatial_dims + n_leading)
     )
-    output_shape = c_shape + new_spatial_shape
+    output_shape = leading_shape + new_spatial_shape
     translation_vector = np.min(new_v[:, :-1], axis=0)
     translation = Translation(translation_vector, axes=axes)
     inverse_matrix_adjusted = Sequence(

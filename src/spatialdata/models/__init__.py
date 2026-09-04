@@ -3,6 +3,8 @@ from __future__ import annotations
 from spatialdata._core.validation import check_target_region_column_symmetry
 from spatialdata.models._utils import (
     C,
+    ROUND,
+    T,
     SpatialElement,
     X,
     Y,
@@ -47,6 +49,8 @@ __all__ = [
     "Y",
     "Z",
     "C",
+    "ROUND",
+    "T",
     "get_axes_names",
     "points_geopandas_to_dask_dataframe",
     "points_dask_dataframe_to_geopandas",

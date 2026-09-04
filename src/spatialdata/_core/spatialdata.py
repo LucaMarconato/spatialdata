@@ -59,8 +59,9 @@ if TYPE_CHECKING:
 
 
 # number of siblings shown at each level of the repr's element/coordinate-system trees before
-# collapsing the rest into a single "... N more" line
-_REPR_TREE_MAX_CHILDREN_SHOWN = 3
+# collapsing the rest into a single "... N more" line: 4 or more siblings triggers truncation,
+# showing the first 2 and collapsing the rest (e.g. 4 channels -> channel0, channel1, ... 2 more)
+_REPR_TREE_MAX_CHILDREN_SHOWN = 2
 
 
 def _insert_into_tree(tree: dict[str, Any], parts: list[str], leaf_value: str) -> None:

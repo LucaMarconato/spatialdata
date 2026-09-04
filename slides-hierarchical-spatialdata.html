@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hierarchical SpatialData</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,600;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reset.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.css">
+<style>
+  :root {
+    --bg:       #0c0d0f;
+    --bg2:      #111318;
+    --surface:  #181b22;
+    --border:   #252933;
+    --muted:    #464f63;
+    --body:     #a8b3cc;
+    --bright:   #e8edf6;
+    --accent:   #4ade80;   /* green — biology vibes */
+    --accent2:  #38bdf8;   /* sky blue */
+    --warn:     #fb923c;
+    --del:      #f87171;
+    --add:      #4ade80;
+    --mono:     'JetBrains Mono', monospace;
+    --sans:     'Syne', sans-serif;
+  }
+
+  /* ── Base ── */
+  .reveal-viewport { background: var(--bg); }
+  .reveal { font-family: var(--sans); color: var(--body); }
+  .reveal .slides { text-align: left; }
+  .reveal .slides section { padding: 0 3rem; }
+
+  /* ── Typography ── */
+  .reveal h1 {
+    font-family: var(--sans);
+    font-weight: 800;
+    font-size: 3.2rem;
+    line-height: 1.05;
+    color: var(--bright);
+    letter-spacing: -0.03em;
+    margin: 0 0 0.5rem;
+    text-transform: none;
+  }
+  .reveal h2 {
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 1.9rem;
+    color: var(--bright);
+    letter-spacing: -0.02em;
+    margin: 0 0 1.8rem;
+    text-transform: none;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.6rem;
+  }
+  .reveal h3 {
+    font-family: var(--mono);
+    font-weight: 400;
+    font-size: 0.85rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 0.4rem;
+  }
+  .reveal p { margin: 0; line-height: 1.65; }
+  .reveal ul { list-style: none; padding: 0; margin: 0; }
+  .reveal ul li {
+    font-size: 1.1rem;
+    color: var(--body);
+    padding: 0.55rem 0;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    gap: 0.8rem;
+  }
+  .reveal ul li:last-child { border-bottom: none; }
+  .reveal ul li::before {
+    content: '→';
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    flex-shrink: 0;
+  }
+
+  /* ── Accent text ── */
+  .accent  { color: var(--accent);  }
+  .accent2 { color: var(--accent2); }
+  .warn    { color: var(--warn);    }
+  .muted   { color: var(--muted);   }
+  .bright  { color: var(--bright);  }
+  .mono    { font-family: var(--mono); }
+
+  /* ── Tag / chip ── */
+  .tag {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    padding: 0.15em 0.55em;
+    border-radius: 3px;
+    background: rgba(74,222,128,.12);
+    color: var(--accent);
+    border: 1px solid rgba(74,222,128,.25);
+    letter-spacing: 0.05em;
+  }
+  .tag.blue {
+    background: rgba(56,189,248,.1);
+    color: var(--accent2);
+    border-color: rgba(56,189,248,.2);
+  }
+  .tag.orange {
+    background: rgba(251,146,60,.1);
+    color: var(--warn);
+    border-color: rgba(251,146,60,.2);
+  }
+
+  /* ── Code blocks ── */
+  .reveal pre {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    line-height: 1.55;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.2rem;
+    margin: 0;
+    overflow: auto;
+    box-shadow: none;
+    width: 100%;
+    max-height: 430px;
+  }
+  .reveal pre code {
+    font-family: var(--mono);
+    background: none;
+    padding: 0;
+    font-size: inherit;
+    color: var(--body);
+    tab-size: 4;
+  }
+  .hl-green { color: var(--accent);  }
+  .hl-blue  { color: var(--accent2); }
+  .hl-warn  { color: var(--warn);    }
+  .hl-del   { color: var(--del);     background: rgba(248,113,113,.08); display: block; }
+  .hl-add   { color: var(--add);     background: rgba(74,222,128,.07);  display: block; }
+  .hl-str   { color: #a3e635; }
+  .hl-kw    { color: #c084fc; }
+  .hl-fn    { color: var(--accent2); }
+  .hl-cm    { color: var(--muted); font-style: italic; }
+
+  /* ── Terminal block ── */
+  .terminal {
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    line-height: 1.65;
+    background: #070809;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1.2rem 1.4rem;
+    color: var(--body);
+    position: relative;
+    white-space: pre;
+  }
+  .terminal::before {
+    content: '● ● ●';
+    display: block;
+    color: var(--muted);
+    font-size: 0.6rem;
+    letter-spacing: 0.3em;
+    margin-bottom: 0.8rem;
+    opacity: 0.5;
+  }
+  .t-folder { color: var(--accent2);  }
+  .t-label  { color: var(--accent);   }
+  .t-muted  { color: var(--muted);    }
+  .t-cs     { color: var(--warn);     }
+  .t-branch { color: #c084fc; }
+
+  /* ── Two-col layout ── */
+  .cols {
+    display: grid;
+    gap: 1.4rem;
+    align-items: start;
+  }
+  .cols-2 { grid-template-columns: 1fr 1fr; }
+  .cols-label {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.5rem;
+  }
+
+  /* ── Divider line ── */
+  .vdiv {
+    width: 1px;
+    background: var(--border);
+    align-self: stretch;
+  }
+
+  /* ── Big number callout ── */
+  .callout {
+    font-family: var(--mono);
+    font-size: 4rem;
+    font-weight: 700;
+    color: var(--accent);
+    line-height: 1;
+  }
+
+  /* ── Title slide specifics ── */
+  .title-eyebrow {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 1.2rem;
+  }
+  .title-sub {
+    font-family: var(--mono);
+    font-size: 1rem;
+    color: var(--muted);
+    margin-top: 1rem;
+  }
+  .title-author {
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-top: 2.5rem;
+    border-top: 1px solid var(--border);
+    padding-top: 1rem;
+    display: flex;
+    gap: 2rem;
+    align-items: center;
+  }
+
+  /* ── Slide rule / horizontal accent ── */
+  .slide-rule {
+    height: 2px;
+    background: linear-gradient(90deg, var(--accent), transparent);
+    border: none;
+    margin: 0 0 1.8rem;
+    opacity: 0.6;
+  }
+
+  /* ── Info box ── */
+  .info-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent2);
+    border-radius: 4px;
+    padding: 0.9rem 1.1rem;
+    font-size: 0.9rem;
+    line-height: 1.55;
+  }
+  .info-box.green { border-left-color: var(--accent); }
+  .info-box.warn  { border-left-color: var(--warn);   }
+
+  /* ── Grid of items ── */
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1rem;
+  }
+  .grid-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.1rem;
+  }
+  .grid-item .gi-icon {
+    font-size: 1.4rem;
+    margin-bottom: 0.4rem;
+  }
+  .grid-item .gi-title {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--accent2);
+    margin-bottom: 0.3rem;
+    letter-spacing: 0.05em;
+  }
+  .grid-item .gi-body {
+    font-size: 0.82rem;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  /* ── Reveal overrides ── */
+  .reveal .progress { background: var(--border); }
+  .reveal .progress span { background: var(--accent); }
+  .reveal .controls { color: var(--muted); }
+  .reveal .slide-number {
+    font-family: var(--mono);
+    font-size: 0.65rem;
+    color: var(--muted);
+    background: none;
+  }
+
+  /* ── Full-height section ── */
+  .reveal section.center-v {
+    display: flex !important;
+    flex-direction: column;
+    justify-content: center;
+    height: 100%;
+  }
+
+  /* ── Slide-in fragments ── */
+  .reveal .fragment.fade-up {
+    opacity: 0;
+    transform: translateY(12px);
+    transition: opacity 0.4s ease, transform 0.4s ease;
+  }
+  .reveal .fragment.fade-up.visible {
+    opacity: 1;
+    transform: none;
+  }
+
+  /* ── Zarr tree diagram ── */
+  .zarr-tree {
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    line-height: 1.8;
+    color: var(--body);
+    white-space: pre;
+  }
+  .zarr-tree .zt-root  { color: var(--accent2); font-weight: 600; }
+  .zarr-tree .zt-type  { color: var(--muted); }
+  .zarr-tree .zt-elem  { color: var(--bright); }
+  .zarr-tree .zt-attr  { color: var(--accent); }
+  .zarr-tree .zt-del   { color: var(--del); text-decoration: line-through; opacity: 0.6; }
+  .zarr-tree .zt-add   { color: var(--add); }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- ════════════════════════════════════════════════
+     1 · TITLE
+════════════════════════════════════════════════ -->
+<section class="center-v">
+  <div class="title-eyebrow">vibecoded experiment</div>
+  <h1>Hierarchical<br><span class="accent">SpatialData</span></h1>
+  <div class="title-sub">grouping elements under a common namespace</div>
+  <div class="title-author">
+    <span>Luca Marconato</span>
+    <span class="muted">·</span>
+    <span class="muted">EMBL</span>
+    <span class="muted">·</span>
+    <span class="tag">branch: vibecoded-experiment/hierarchical-spatialdata</span>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     2 · THE PROBLEM
+════════════════════════════════════════════════ -->
+<section>
+  <h2>The Problem</h2>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1.4rem;">
+    A flat namespace — all elements live at the same level.
+  </p>
+  <div class="terminal">
+<span class="t-muted">SpatialData object</span>
+├── <span class="t-label">sample1_he_image</span>    <span class="t-muted">[Image2D]  DataArray[cyx] (3, 4096, 4096)</span>
+├── <span class="t-label">sample1_dapi_image</span>  <span class="t-muted">[Image2D]  DataArray[cyx] (3, 4096, 4096)</span>
+├── <span class="t-label">sample1_cells</span>       <span class="t-muted">[Shapes]   GeoDataFrame (12043, 2)</span>
+├── <span class="t-label">sample1_nuclei</span>      <span class="t-muted">[Labels2D] DataArray[yx]  (4096, 4096)</span>
+├── <span class="t-label">sample2_he_image</span>    <span class="t-muted">[Image2D]  DataArray[cyx] (3, 4096, 4096)</span>
+├── <span class="t-label">sample2_dapi_image</span>  <span class="t-muted">[Image2D]  DataArray[cyx] (3, 4096, 4096)</span>
+├── <span class="t-label">sample2_cells</span>       <span class="t-muted">[Shapes]   GeoDataFrame (9871, 2)</span>
+└── <span class="t-label">sample2_nuclei</span>      <span class="t-muted">[Labels2D] DataArray[yx]  (4096, 4096)</span>
+  </div>
+  <div style="margin-top:1.2rem; display:flex; gap:0.8rem; flex-wrap:wrap;">
+    <div class="tag orange">no grouping semantics</div>
+    <div class="tag orange">name collisions across samples</div>
+    <div class="tag orange">long repetitive names</div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     3 · THE SOLUTION
+════════════════════════════════════════════════ -->
+<section>
+  <h2>The Solution</h2>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1.4rem;">
+    Use <span class="mono accent">"/"</span> as a path separator — like a filesystem.
+  </p>
+  <div class="terminal">
+<span class="t-muted">SpatialData object</span>
+├── <span class="t-folder">sample1/</span>  <span class="t-muted">(4 elements)</span>
+│   ├── <span class="t-label">he_image</span>    <span class="t-muted">[Image2D]  DataArray[cyx] (3, 4096, 4096)</span>
+│   ├── <span class="t-label">dapi_image</span>  <span class="t-muted">[Image2D]  DataArray[cyx] (3, 4096, 4096)</span>
+│   ├── <span class="t-label">cells</span>       <span class="t-muted">[Shapes]   GeoDataFrame (12043, 2)</span>
+│   └── <span class="t-label">nuclei</span>      <span class="t-muted">[Labels2D] DataArray[yx]  (4096, 4096)</span>
+└── <span class="t-folder">sample2/</span>  <span class="t-muted">(4 elements)</span>
+    ├── <span class="t-label">he_image</span>    <span class="t-muted">[Image2D]  DataArray[cyx] (3, 4096, 4096)</span>
+    ├── <span class="t-label">dapi_image</span>  <span class="t-muted">[Image2D]  DataArray[cyx] (3, 4096, 4096)</span>
+    ├── <span class="t-label">cells</span>       <span class="t-muted">[Shapes]   GeoDataFrame (9871, 2)</span>
+    └── <span class="t-label">nuclei</span>      <span class="t-muted">[Labels2D] DataArray[yx]  (4096, 4096)</span>
+  </div>
+  <div style="margin-top:1.2rem; display:flex; gap:0.8rem; flex-wrap:wrap;">
+    <div class="tag">natural grouping</div>
+    <div class="tag">short names within a group</div>
+    <div class="tag">slice by prefix</div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     4 · CODE — BEFORE / AFTER
+════════════════════════════════════════════════ -->
+<section>
+  <h2>API</h2>
+  <div class="cols cols-2" style="gap:1rem;">
+    <div>
+      <div class="cols-label">before</div>
+      <pre><code><span class="hl-fn">SpatialData</span>(
+  <span class="hl-kw">images</span>={
+    <span class="hl-str">"s1_he"</span>:   img1,
+    <span class="hl-str">"s1_dapi"</span>: img2,
+    <span class="hl-str">"s2_he"</span>:   img3,
+  },
+  <span class="hl-kw">labels</span>={
+    <span class="hl-str">"s1_nuclei"</span>: lbl1,
+    <span class="hl-str">"s2_nuclei"</span>: lbl2,
+  },
+)</code></pre>
+    </div>
+    <div>
+      <div class="cols-label" style="color:var(--accent);">after</div>
+      <pre><code><span class="hl-fn">SpatialData</span>(
+  <span class="hl-kw">elements</span>={
+    <span class="hl-str">"sample1/he"</span>:     img1,
+    <span class="hl-str">"sample1/dapi"</span>:   img2,
+    <span class="hl-str">"sample1/nuclei"</span>: lbl1,
+    <span class="hl-str">"sample2/he"</span>:     img3,
+    <span class="hl-str">"sample2/nuclei"</span>: lbl2,
+  },
+)</code></pre>
+    </div>
+  </div>
+  <div class="info-box" style="margin-top:1.2rem; font-size:0.82rem;">
+    Old <span class="mono accent2">images=</span>, <span class="mono accent2">labels=</span>, … kwargs still work — they merge into the flat <span class="mono accent">elements</span> dict.
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     5 · MOCK CODE — BEFORE
+════════════════════════════════════════════════ -->
+<section>
+  <h2>Mock code — before</h2>
+  <pre><code><span class="hl-cm"># ── create ──────────────────────────────────────────────────────</span>
+sdata = <span class="hl-fn">SpatialData</span>(
+    <span class="hl-kw">images</span> = {<span class="hl-str">"sample1_he"</span>: he1, <span class="hl-str">"sample2_he"</span>: he2},
+    <span class="hl-kw">labels</span> = {<span class="hl-str">"sample1_nuclei"</span>: lbl1, <span class="hl-str">"sample2_nuclei"</span>: lbl2},
+    <span class="hl-kw">tables</span> = {<span class="hl-str">"sample1_table"</span>: tbl1, <span class="hl-str">"sample2_table"</span>: tbl2},
+)
+
+<span class="hl-cm"># ── access ──────────────────────────────────────────────────────</span>
+sdata[<span class="hl-str">"sample1_he"</span>]           <span class="hl-cm"># → DataArray  (searches all typed containers)</span>
+sdata.images[<span class="hl-str">"sample1_he"</span>]   <span class="hl-cm"># → DataArray  (via typed container)</span>
+sdata.images                    <span class="hl-cm"># → Images container with ALL images flat</span>
+
+<span class="hl-cm"># ── on-disk layout ──────────────────────────────────────────────</span>
+sdata.write(<span class="hl-str">"study.zarr"</span>)
+<span class="hl-cm"># study.zarr/images/sample1_he/    ← type subdir required</span>
+<span class="hl-cm"># study.zarr/labels/sample1_nuclei/</span>
+<span class="hl-cm"># study.zarr/tables/sample1_table/</span>
+
+<span class="hl-cm"># ── partial read — must know the type subdir ────────────────────</span>
+<span class="hl-fn">read_zarr</span>(<span class="hl-str">"study.zarr"</span>, selection=[<span class="hl-str">"images"</span>])</code></pre>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     6 · MOCK CODE — AFTER
+════════════════════════════════════════════════ -->
+<section>
+  <h2>Mock code — after</h2>
+  <pre><code><span class="hl-cm"># ── create ──────────────────────────────────────────────────────</span>
+sdata = <span class="hl-fn">SpatialData</span>(<span class="hl-kw">elements</span>={
+    <span class="hl-str">"sample1/he"</span>:      he1,   <span class="hl-str">"sample2/he"</span>:      he2,
+    <span class="hl-str">"sample1/nuclei"</span>:  lbl1,  <span class="hl-str">"sample2/nuclei"</span>:  lbl2,
+    <span class="hl-str">"sample1/table"</span>:   tbl1,  <span class="hl-str">"sample2/table"</span>:   tbl2,
+})
+
+<span class="hl-cm"># ── access ──────────────────────────────────────────────────────</span>
+sdata[<span class="hl-str">"sample1/he"</span>]   <span class="hl-cm"># → DataArray  (direct dict lookup)</span>
+sdata[<span class="hl-str">"sample1"</span>]      <span class="hl-cm"># → SpatialData  keys: {"he", "nuclei", "table"}</span>
+sub = sdata[<span class="hl-str">"sample1"</span>]
+sub[<span class="hl-str">"he"</span>]            <span class="hl-cm"># → DataArray  (same as sdata["sample1/he"])</span>
+sdata.images        <span class="hl-cm"># → dict  {"sample1/he": …, "sample2/he": …}</span>
+
+<span class="hl-cm"># ── on-disk layout ──────────────────────────────────────────────</span>
+sdata.write(<span class="hl-str">"study.zarr"</span>)
+<span class="hl-cm"># study.zarr/sample1/he/      .zattrs → {element_type: "images"}</span>
+<span class="hl-cm"># study.zarr/sample1/nuclei/  .zattrs → {element_type: "labels"}</span>
+<span class="hl-cm"># study.zarr/sample2/he/      .zattrs → {element_type: "images"}</span>
+
+<span class="hl-cm"># ── partial read — just point at a subfolder ────────────────────</span>
+sub = <span class="hl-fn">SpatialData</span>.read(<span class="hl-str">"study.zarr/sample1"</span>)  <span class="hl-cm"># keys: {"he", "nuclei", "table"}</span></code></pre>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     7 · WHAT'S NEW
+════════════════════════════════════════════════ -->
+<section>
+  <h2>What changed</h2>
+  <ul>
+    <li>
+      <span>Single <span class="mono accent">_elements: dict[str, SpatialElement | AnnData]</span> replaces five typed containers</span>
+    </li>
+    <li>
+      <span><span class="mono accent">"/"</span> allowed in element names — each path component validated independently</span>
+    </li>
+    <li>
+      <span><span class="mono accent2">sdata["sample1"]</span> returns a sub-<span class="mono">SpatialData</span> view with stripped prefix keys</span>
+    </li>
+    <li>
+      <span>Typed properties (<span class="mono">.images</span>, <span class="mono">.labels</span>, …) now return filtered plain <span class="mono">dict</span>s</span>
+    </li>
+    <li>
+      <span>Tree-style <span class="mono">repr</span> groups elements under their common prefix folder</span>
+    </li>
+  </ul>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     6 · TREE REPR
+════════════════════════════════════════════════ -->
+<section>
+  <h2>repr</h2>
+  <div class="terminal">
+<span class="t-muted">SpatialData object</span>
+<span class="t-muted">├──</span> <span class="t-label">global_points</span><span class="t-muted">: [Points2D] DataFrame (1000, 3)</span>
+<span class="t-muted">└──</span> <span class="t-folder">sample1/</span> <span class="t-muted">(3 elements)</span>
+<span class="t-muted">    ├──</span> <span class="t-label">he</span><span class="t-muted">: [Image2D] DataArray[cyx] (3, 4096, 4096)</span>
+<span class="t-muted">    ├──</span> <span class="t-label">labels</span><span class="t-muted">: [Labels2D] DataArray[yx] (4096, 4096)</span>
+<span class="t-muted">    └──</span> <span class="t-label">table</span><span class="t-muted">: [Table] AnnData (12043, 500)</span>
+<span class="t-muted">with coordinate systems:</span>
+<span class="t-muted">    ▸</span> <span class="t-cs">'global'</span><span class="t-muted">, with elements:</span>
+<span class="t-muted">        global_points, sample1/he, sample1/labels</span>
+  </div>
+  <div style="margin-top:1rem; display:flex; gap:1rem;">
+    <div class="info-box" style="flex:1; font-size:0.8rem;">
+      Flat elements (no <span class="mono">/</span>) render at root level.<br>
+      Grouped elements collapse under a <span class="mono accent2">folder/</span> header.
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     7 · BACKWARDS COMPAT
+════════════════════════════════════════════════ -->
+<section>
+  <h2>Backwards compatible</h2>
+  <pre><code><span class="hl-cm"># ✓  old-style kwargs still work</span>
+sdata = <span class="hl-fn">SpatialData</span>(<span class="hl-kw">images</span>={<span class="hl-str">"img"</span>: img}, <span class="hl-kw">labels</span>={<span class="hl-str">"lbl"</span>: lbl})
+
+<span class="hl-cm"># ✓  typed property access still works</span>
+sdata.images   <span class="hl-cm"># → dict[str, Raster_T]  (filtered from _elements)</span>
+sdata.labels   <span class="hl-cm"># → dict[str, Raster_T]</span>
+sdata.tables   <span class="hl-cm"># → dict[str, AnnData]</span>
+
+<span class="hl-cm"># ✓  setitem / delitem still work</span>
+sdata[<span class="hl-str">"img"</span>] = img2
+<span class="hl-kw">del</span> sdata[<span class="hl-str">"img"</span>]
+
+<span class="hl-cm"># ✓  new: prefix delete</span>
+<span class="hl-kw">del</span> sdata[<span class="hl-str">"sample1"</span>]  <span class="hl-cm"># removes all sample1/* elements</span>
+
+<span class="hl-cm"># ✓  new: prefix slice</span>
+sub = sdata[<span class="hl-str">"sample1"</span>]  <span class="hl-cm"># SpatialData with keys {"he": …, "labels": …}</span></code></pre>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     8 · I/O  (flat zarr layout)
+════════════════════════════════════════════════ -->
+<section>
+  <h2>I/O — flat Zarr layout</h2>
+  <div class="cols cols-2" style="gap:1.2rem; align-items:start;">
+    <div>
+      <div class="cols-label">old layout (v0.1 / v0.2)</div>
+      <div class="zarr-tree" style="background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:1rem 1.2rem;">
+<span class="zt-root">store.zarr/</span>
+<span class="zt-del">├── images/</span>
+<span class="zt-del">│   ├── sample1_he/</span>
+<span class="zt-del">│   └── sample1_dapi/</span>
+<span class="zt-del">├── labels/</span>
+<span class="zt-del">│   └── sample1_nuclei/</span>
+<span class="zt-del">└── tables/</span>
+<span class="zt-del">    └── sample1_table/</span>
+      </div>
+    </div>
+    <div>
+      <div class="cols-label" style="color:var(--accent);">new layout (v0.3)</div>
+      <div class="zarr-tree" style="background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:1rem 1.2rem;">
+<span class="zt-root">store.zarr/</span>
+<span class="zt-add">└── sample1/</span>
+<span class="zt-add">    ├── he/</span>
+<span class="zt-add">    │   └── <span class="zt-attr">.zattrs → {element_type: "images"}</span></span>
+<span class="zt-add">    ├── dapi/</span>
+<span class="zt-add">    │   └── <span class="zt-attr">.zattrs → {element_type: "images"}</span></span>
+<span class="zt-add">    └── nuclei/</span>
+<span class="zt-add">        └── <span class="zt-attr">.zattrs → {element_type: "labels"}</span></span>
+      </div>
+    </div>
+  </div>
+  <div class="info-box" style="margin-top:1.1rem; font-size:0.8rem;">
+    Reader scans recursively for <span class="mono accent">spatialdata_attrs.element_type</span> to identify elements.
+    v0.1 / v0.2 stores are read with the old path — backward compat preserved.
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════
+     9 · TRY IT
+════════════════════════════════════════════════ -->
+<section class="center-v">
+  <h3>try it</h3>
+  <h1 style="font-size:2.4rem;">
+    <span class="accent">git checkout</span><br>
+    <span class="mono" style="font-size:1.6rem; color:var(--accent2); font-weight:400;">vibecoded-experiment/<br>hierarchical-spatialdata</span>
+  </h1>
+  <div style="margin-top:2rem; display:flex; flex-direction:column; gap:0.7rem;">
+    <div class="info-box green" style="font-size:0.82rem;">
+      <span class="mono accent">github.com/scverse/spatialdata</span>
+      — branch <span class="mono accent2">vibecoded-experiment/hierarchical-spatialdata</span>
+    </div>
+    <div class="info-box" style="font-size:0.78rem; color:var(--muted);">
+      This is an experiment. The API may change. Feedback welcome.
+    </div>
+  </div>
+</section>
+
+</div><!-- /.slides -->
+</div><!-- /.reveal -->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.js"></script>
+<script>
+Reveal.initialize({
+  hash: true,
+  slideNumber: 'c/t',
+  controls: true,
+  progress: true,
+  transition: 'fade',
+  transitionSpeed: 'fast',
+  center: false,
+  width: 1100,
+  height: 680,
+  margin: 0.06,
+});
+</script>
+</body>
+</html>

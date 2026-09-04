@@ -85,12 +85,13 @@ def check_valid_name(name: str) -> None:
     Check that a name is valid for SpatialData elements.
 
     This checks whether the proposed name fulfills the naming restrictions and raises an error
-    otherwise.
+    otherwise. A "/" may be used as a path separator for hierarchical names (e.g. "sample1/image").
+    Each path component separated by "/" must individually satisfy the character restrictions.
 
     Parameters
     ----------
     name
-        The name for a SpatialData element
+        The name for a SpatialData element. May contain "/" as a hierarchical separator.
 
     Raises
     ------
@@ -103,14 +104,22 @@ def check_valid_name(name: str) -> None:
         raise TypeError(f"Name must be a string, not {type(name).__name__}.")
     if len(name) == 0:
         raise ValueError("Name cannot be an empty string.")
-    if name == ".":
-        raise ValueError("Name cannot be '.'.")
-    if name == "..":
-        raise ValueError("Name cannot be '..'.")
-    if name.startswith("__"):
-        raise ValueError("Name cannot start with '__'.")
-    if not all(c.isalnum() or c in "_-." for c in name):
-        raise ValueError("Name must contain only alphanumeric characters, underscores, dots and hyphens.")
+    # Validate each component separated by "/"
+    components = name.split("/")
+    for component in components:
+        if len(component) == 0:
+            raise ValueError(f"Name {name!r} contains an empty path component (e.g. leading/trailing/double '/').")
+        if component == ".":
+            raise ValueError(f"Name {name!r} contains a '.' path component.")
+        if component == "..":
+            raise ValueError(f"Name {name!r} contains a '..' path component.")
+        if component.startswith("__"):
+            raise ValueError(f"Name {name!r} contains a path component starting with '__'.")
+        if not all(c.isalnum() or c in "_-." for c in component):
+            raise ValueError(
+                f"Name {name!r} contains a path component {component!r} with invalid characters. "
+                "Each path component must contain only alphanumeric characters, underscores, dots and hyphens."
+            )
 
 
 def check_all_keys_case_insensitively_unique(keys: Collection[str], location: tuple[str, ...] = ()) -> None:

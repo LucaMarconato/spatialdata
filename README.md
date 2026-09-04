@@ -1,5 +1,14 @@
 ![SpatialData banner](https://github.com/scverse/spatialdata/blob/main/docs/_static/img/spatialdata_horizontal.png?raw=true)
 
+> [!WARNING]
+> ## DO NOT USE THIS BRANCH IN PRODUCTION
+>
+> **This branch (`vibecoded-experiment/template`) is a template for design experiments and must NOT be used in production. Do not open PRs from this branch. Do not use this code.**
+>
+> This branch may be heavily vibe-coded. Its sole purpose is to serve as a starting point for quickly comparing different redesign approaches before making a decision.
+>
+> **To use this template:** create a new branch from this one, and please name it `vibecoded-experiment/<name-of-your-experiment>` so it can be easily identified.
+
 # SpatialData: an open and universal framework for processing spatial omics data.
 
 [![Tests][badge-tests]][link-tests]

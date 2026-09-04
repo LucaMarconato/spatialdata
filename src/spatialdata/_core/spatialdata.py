@@ -5,7 +5,6 @@ import json
 import os
 import warnings
 from collections.abc import Generator, Mapping
-from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -14,7 +13,7 @@ import zarr
 from anndata import AnnData
 from annsel.core.typing import Predicates
 from dask.dataframe import DataFrame as DaskDataFrame
-from dask.dataframe import Scalar
+from dask.dataframe import Scalar, read_parquet
 from geopandas import GeoDataFrame
 from shapely import MultiPolygon, Polygon
 from upath import UPath
@@ -114,6 +113,7 @@ class SpatialData:
 
     def __init__(
         self,
+        elements: dict[str, SpatialElement | AnnData] | None = None,
         images: dict[str, Raster_T] | None = None,
         labels: dict[str, Raster_T] | None = None,
         points: dict[str, DaskDataFrame] | None = None,
@@ -122,17 +122,25 @@ class SpatialData:
         attrs: Mapping[Any, Any] | None = None,
     ) -> None:
         self._path: Path | None = None
-
-        self._shared_keys: set[str | None] = set()
-        self._images: Images = Images(shared_keys=self._shared_keys)
-        self._labels: Labels = Labels(shared_keys=self._shared_keys)
-        self._points: Points = Points(shared_keys=self._shared_keys)
-        self._shapes: Shapes = Shapes(shared_keys=self._shared_keys)
-        self._tables: Tables = Tables(shared_keys=self._shared_keys)
+        self._elements: dict[str, SpatialElement | AnnData] = {}
         self.attrs = attrs if attrs else {}  # type: ignore[assignment]
 
-        element_names = list(chain.from_iterable([e.keys() for e in [images, labels, points, shapes] if e is not None]))
+        # Build elements from typed dicts for backward compatibility
+        if elements is None:
+            elements = {}
+            for k, v in (images or {}).items():
+                elements[k] = v
+            for k, v in (labels or {}).items():
+                elements[k] = v
+            for k, v in (points or {}).items():
+                elements[k] = v
+            for k, v in (shapes or {}).items():
+                elements[k] = v
+            for k, v in (tables or {}).items():
+                elements[k] = v
 
+        # Check uniqueness
+        element_names = list(elements.keys())
         if len(element_names) != len(set(element_names)):
             duplicates = {x for x in element_names if element_names.count(x) > 1}
             raise KeyError(
@@ -144,31 +152,9 @@ class SpatialData:
             "For renaming, please see the discussion here https://github.com/scverse/spatialdata/discussions/707 .",
             exc_type=(ValueError, KeyError),
         ) as collect_error:
-            if images is not None:
-                for k, v in images.items():
-                    with collect_error(location=("images", k)):
-                        self.images[k] = v
-
-            if labels is not None:
-                for k, v in labels.items():
-                    with collect_error(location=("labels", k)):
-                        self.labels[k] = v
-
-            if shapes is not None:
-                for k, v in shapes.items():
-                    with collect_error(location=("shapes", k)):
-                        self.shapes[k] = v
-
-            if points is not None:
-                for k, v in points.items():
-                    with collect_error(location=("points", k)):
-                        self.points[k] = v
-
-            if tables is not None:
-                for k, v in tables.items():
-                    with collect_error(location=("tables", k)):
-                        self.validate_table_in_spatialdata(v)
-                        self.tables[k] = v
+            for k, v in elements.items():
+                with collect_error(location=(k,)):
+                    self[k] = v  # validation happens in __setitem__
 
     def validate_table_in_spatialdata(self, table: AnnData) -> None:
         """
@@ -561,7 +547,7 @@ class SpatialData:
 
     def locate_element(self, element: SpatialElement) -> list[str]:
         """
-        Locate a SpatialElement within the SpatialData object and returns its Zarr paths relative to the root.
+        Locate a SpatialElement within the SpatialData object and returns its element names.
 
         Parameters
         ----------
@@ -570,23 +556,15 @@ class SpatialData:
 
         Returns
         -------
-        A list of Zarr paths of the element relative to the root (multiple copies of the same element are allowed).
-        The list is empty if the element is not present.
+        A list of element names (keys in _elements) for the given element object.
+        The list is empty if the element is not present. Multiple entries are possible if the same
+        object is stored under multiple names.
         """
-        found: list[SpatialElement] = []
-        found_element_type: list[str] = []
-        found_element_name: list[str] = []
-        for element_type in ["images", "labels", "points", "shapes", "tables"]:
-            for element_name, element_value in getattr(self, element_type).items():
-                if element_value is element:
-                    found.append(element_value)
-                    found_element_type.append(element_type)
-                    found_element_name.append(element_name)
-        if len(found) == 0:
-            return []
-        if any("/" in found_element_name[i] or "/" in found_element_type[i] for i in range(len(found))):
-            raise ValueError("Found an element name with a '/' character. This is not allowed.")
-        return [f"{found_element_type[i]}/{found_element_name[i]}" for i in range(len(found))]
+        found = []
+        for element_name, element_value in self._elements.items():
+            if element_value is element:
+                found.append(element_name)
+        return found
 
     def filter_by_coordinate_system(
         self,
@@ -619,7 +597,7 @@ class SpatialData:
 
         from spatialdata.transformations.operations import get_transformation
 
-        elements: dict[str, dict[str, SpatialElement]] = {}
+        flat_elements: dict[str, SpatialElement | AnnData] = {}
         element_names_in_coordinate_system = []
         if isinstance(coordinate_system, str):
             coordinate_system = [coordinate_system]
@@ -629,9 +607,7 @@ class SpatialData:
                 assert isinstance(transformations, dict)
                 for cs in coordinate_system:
                     if cs in transformations:
-                        if element_type not in elements:
-                            elements[element_type] = {}
-                        elements[element_type][element_name] = element
+                        flat_elements[element_name] = element
                         element_names_in_coordinate_system.append(element_name)
         tables = self._filter_tables(
             set(),
@@ -640,8 +616,8 @@ class SpatialData:
             include_orphan_tables,
             element_names=element_names_in_coordinate_system,
         )
-
-        return SpatialData(**elements, tables=tables, attrs=self.attrs)
+        all_elements = {**flat_elements, **tables}
+        return SpatialData(elements=all_elements, attrs=self.attrs)
 
     # TODO: move to relational query with refactor
     def _filter_tables(
@@ -651,7 +627,7 @@ class SpatialData:
         by: Literal["cs", "elements"] | None = None,
         include_orphan_tables: bool = False,
         element_names: str | list[str] | None = None,
-        elements_dict: dict[str, dict[str, Any]] | None = None,
+        elements_dict: dict[str, Any] | None = None,
     ) -> Tables | dict[str, AnnData]:
         """
         Filter tables by coordinate system or elements or return tables.
@@ -680,7 +656,7 @@ class SpatialData:
         """
         if filter_tables:
             tables: dict[str, AnnData] | Tables = {}
-            for table_name, table in self._tables.items():
+            for table_name, table in self.tables.items():
                 if include_orphan_tables and not table.uns.get(TableModel.ATTRS_KEY):
                     tables[table_name] = table
                     continue
@@ -710,9 +686,26 @@ class SpatialData:
                     )
 
                     assert elements_dict is not None
-                    table = _filter_table_by_elements(table, elements_dict=elements_dict)
-                    if table is not None and len(table) != 0:
-                        tables[table_name] = table
+                    # Convert flat {name: element} dict to typed {element_type: {name: element}} dict
+                    # as expected by _filter_table_by_elements
+                    typed_elements_dict: dict[str, dict[str, Any]] = {}
+                    for elem_name, elem_val in elements_dict.items():
+                        elem_model = get_model(elem_val)
+                        if elem_model in (Image2DModel, Image3DModel):
+                            elem_type = "images"
+                        elif elem_model in (Labels2DModel, Labels3DModel):
+                            elem_type = "labels"
+                        elif elem_model == PointsModel:
+                            elem_type = "points"
+                        elif elem_model == ShapesModel:
+                            elem_type = "shapes"
+                        else:
+                            continue
+                        typed_elements_dict.setdefault(elem_type, {})[elem_name] = elem_val
+                    if typed_elements_dict:
+                        table = _filter_table_by_elements(table, elements_dict=typed_elements_dict)
+                        if table is not None and len(table) != 0:
+                            tables[table_name] = table
         else:
             tables = self.tables
 
@@ -879,7 +872,7 @@ class SpatialData:
         The transformed SpatialData.
         """
         sdata = self.filter_by_coordinate_system(target_coordinate_system, filter_tables=False)
-        elements: dict[str, dict[str, SpatialElement]] = {}
+        flat_elements: dict[str, SpatialElement | AnnData] = {}
         for element_type, element_name, _ in sdata.gen_elements():
             if element_type != "tables":
                 transformed = sdata.transform_element_to_coordinate_system(
@@ -887,10 +880,9 @@ class SpatialData:
                     target_coordinate_system,
                     maintain_positioning=maintain_positioning,
                 )
-                if element_type not in elements:
-                    elements[element_type] = {}
-                elements[element_type][element_name] = transformed
-        return SpatialData(**elements, tables=sdata.tables, attrs=self.attrs)
+                flat_elements[element_name] = transformed
+        all_elements = {**flat_elements, **sdata.tables}
+        return SpatialData(elements=all_elements, attrs=self.attrs)
 
     def elements_are_self_contained(self) -> dict[str, bool]:
         """
@@ -913,7 +905,8 @@ class SpatialData:
         self._validate_element_names_are_unique()
         description = {}
         for element_type, element_name, element in self.gen_elements():
-            element_path = self.path / element_type / element_name
+            # New flat layout: element_path = root/element_name (no type subdir)
+            element_path = self.path / element_name
             description[element_name] = _is_element_self_contained(element, element_path)
         return description
 
@@ -971,12 +964,11 @@ class SpatialData:
 
         Notes
         -----
-        The paths are relative to the root of the SpatialData object and are in the format "element_type/element_name".
+        The paths are in the format "element_type/element_name" for backward compatibility.
         """
         elements_in_sdata = []
-        for element_type in ["images", "labels", "points", "shapes", "tables"]:
-            for element_name in getattr(self, element_type):
-                elements_in_sdata.append(f"{element_type}/{element_name}")
+        for element_type, element_name, _ in self.gen_elements():
+            elements_in_sdata.append(f"{element_type}/{element_name}")
         return elements_in_sdata
 
     def elements_paths_on_disk(self) -> list[str]:
@@ -1097,9 +1089,11 @@ class SpatialData:
             exc_type=ValueError,
         ) as collect_error:
             for element_type, element_name, element in self.gen_elements():
-                element_path = (element_type, element_name)
+                element_path = (element_name,)
                 with collect_error(location=element_path):
-                    check_valid_name(element_name)
+                    # validate each component of the hierarchical path
+                    for component in element_name.split("/"):
+                        check_valid_name(component)
                 if element_type == "tables":
                     with collect_error(location=element_path):
                         validate_table_attr_keys(element, location=element_path)
@@ -1219,19 +1213,20 @@ class SpatialData:
         raster_compressor: dict[Literal["lz4", "zstd"], int] | None = None,
         convert_table_strings_to_categoricals: bool = False,
     ) -> None:
-        from spatialdata._io.io_zarr import _get_groups_for_element
+        from spatialdata._io.io_zarr import _get_or_create_flat_element_group
 
         if not isinstance(zarr_container_path, Path):
             raise ValueError(
                 f"zarr_container_path must be a Path object, type(zarr_container_path) = {type(zarr_container_path)}."
             )
-        file_path_of_element = zarr_container_path / element_type / element_name
+        # Flat layout: element lives at root/element_name (no type subdir)
+        file_path_of_element = zarr_container_path / element_name
         self._validate_can_safely_write_to_path(
             file_path=file_path_of_element, overwrite=overwrite, saving_an_element=True
         )
 
-        root_group, element_type_group, element_group = _get_groups_for_element(
-            zarr_path=zarr_container_path, element_type=element_type, element_name=element_name, use_consolidated=False
+        root_group, element_group = _get_or_create_flat_element_group(
+            zarr_path=zarr_container_path, element_type=element_type, element_name=element_name
         )
         from spatialdata._io import (
             write_image,
@@ -1245,6 +1240,9 @@ class SpatialData:
         if parsed_formats is None:
             parsed_formats = _parse_formats(formats=parsed_formats)
 
+        # leaf_name is the last path component (for labels/table writers that use name as group key)
+        leaf_name = element_name.split("/")[-1]
+
         if element_type != "tables":
             from spatialdata.models import validate_element
 
@@ -1254,15 +1252,16 @@ class SpatialData:
             write_image(
                 image=element,
                 group=element_group,
-                name=element_name,
+                name=leaf_name,
                 element_format=parsed_formats["raster"],
                 raster_compressor=raster_compressor,
             )
         elif element_type == "labels":
+            # write_labels writes to group["labels"][name]; pass element_group as the "root"
             write_labels(
                 labels=element,
-                group=root_group,
-                name=element_name,
+                group=element_group,
+                name=leaf_name,
                 element_format=parsed_formats["raster"],
                 raster_compressor=raster_compressor,
             )
@@ -1280,10 +1279,12 @@ class SpatialData:
                 geometry_encoding=shapes_geometry_encoding,
             )
         elif element_type == "tables":
+            # write_table expects a parent group and a name; element_group is the element group,
+            # so we pass its parent and leaf_name
             write_table(
                 table=element,
-                group=element_type_group,
-                name=element_name,
+                group=element_group.parent if element_group.name != "/" else element_group,
+                name=leaf_name,
                 element_format=parsed_formats["tables"],
                 convert_strings_to_categoricals=convert_table_strings_to_categoricals,
             )
@@ -1449,16 +1450,8 @@ class SpatialData:
             _element_type = self._element_type_from_element_name(element_name)
             self._check_element_not_on_disk_with_different_type(element_type=_element_type, element_name=element_name)
 
-        element_type = None
-        on_disk = self.elements_paths_on_disk()
-        for path in on_disk:
-            _element_type, _element_name = self._element_type_and_name_from_element_path(path)
-            if _element_name == element_name:
-                element_type = _element_type
-                break
-        assert element_type is not None
-
-        file_path_of_element = self.path / element_type / element_name
+        # Flat layout: element lives at root/element_name
+        file_path_of_element = self.path / element_name
         if any(_backed_elements_contained_in_path(path=file_path_of_element, object=self)):
             raise ValueError(
                 "The file path specified is a parent directory of one or more files used for backing for one or "
@@ -1467,26 +1460,36 @@ class SpatialData:
 
         from spatialdata._io._utils import _resolve_zarr_store
 
-        # delete the element
+        # delete the element (flat layout: del root[element_name])
         store = _resolve_zarr_store(self.path)
         root = zarr.open_group(store=store, mode="r+", use_consolidated=False)
-        del root[element_type][element_name]
+        del root[element_name]
         store.close()
 
         if self.has_consolidated_metadata():
             self.write_consolidated_metadata()
 
     def _check_element_not_on_disk_with_different_type(self, element_type: str, element_name: str) -> None:
-        only_on_disk = self.elements_paths_on_disk()
-        for disk_path in only_on_disk:
-            disk_element_type, disk_element_name = self._element_type_and_name_from_element_path(disk_path)
-            if disk_element_name == element_name and disk_element_type != element_type:
-                raise ValueError(
-                    f"Element {element_name} is found in the Zarr store as a {disk_element_type}, but it is found "
-                    f"in-memory as a {element_type}. The in-memory object should have a different name. If you want to "
-                    f"maintain both objects, please rename the in-memory object. Alternatively, you can rename the"
-                    f" element on disk (manually)."
-                )
+        # In the new flat layout, the element_type is stored in the element's spatialdata_attrs,
+        # not in its path. We just verify the element exists on disk without a type mismatch check.
+        # This is a best-effort check for backward compat with v0.1/0.2 stores.
+        if self.path is None:
+            return
+        try:
+            only_on_disk = self.elements_paths_on_disk()
+            for disk_path in only_on_disk:
+                parts = disk_path.split("/")
+                if len(parts) == 2:
+                    disk_element_type, disk_element_name = parts[0], parts[1]
+                    if disk_element_name == element_name and disk_element_type != element_type:
+                        raise ValueError(
+                            f"Element {element_name} is found in the Zarr store as a {disk_element_type}, but it is "
+                            f"found in-memory as a {element_type}. The in-memory object should have a different name. "
+                            f"If you want to maintain both objects, please rename the in-memory object. Alternatively, "
+                            f"you can rename the element on disk (manually)."
+                        )
+        except Exception:
+            pass
 
     def write_consolidated_metadata(self) -> None:
         from spatialdata._io.io_zarr import _write_consolidated_metadata
@@ -1529,14 +1532,15 @@ class SpatialData:
 
         self._check_element_not_on_disk_with_different_type(element_type=element_type, element_name=element_name)
 
-        # check if the element exists in the Zarr storage
-        if not _group_for_element_exists(
+        # check if the element exists in the Zarr storage (flat layout: root/element_name)
+        from spatialdata._io.io_zarr import _group_for_flat_element_exists
+
+        if not _group_for_flat_element_exists(
             zarr_path=Path(self.path),
-            element_type=element_type,
             element_name=element_name,
         ):
             warnings.warn(
-                f"Not saving the metadata to element {element_type}/{element_name} as it is"
+                f"Not saving the metadata to element {element_name} as it is"
                 " not found in Zarr storage. You may choose to call write_element() first.",
                 UserWarning,
                 stacklevel=2,
@@ -1545,10 +1549,10 @@ class SpatialData:
 
         # warn the users if the element is not self-contained, that is, it is Dask-backed by files outside the Zarr
         # group for the element
-        element_zarr_path = Path(self.path) / element_type / element_name
+        element_zarr_path = Path(self.path) / element_name
         if not _is_element_self_contained(element=element, element_path=element_zarr_path):
             logger.info(
-                f"Element {element_type}/{element_name} is not self-contained. The metadata will be"
+                f"Element {element_name} is not self-contained. The metadata will be"
                 " saved to the Zarr group of the element in the SpatialData Zarr store. The data outside the element "
                 "Zarr group will not be affected."
             )
@@ -1585,8 +1589,10 @@ class SpatialData:
 
         # Mypy does not understand that path is not None so we have the check in the conditional
         if element_type == "images" and self.path is not None:
-            _, _, element_group = _get_groups_for_element(
-                zarr_path=Path(self.path), element_type=element_type, element_name=element_name, use_consolidated=False
+            from spatialdata._io.io_zarr import _get_flat_element_group
+
+            element_group = _get_flat_element_group(
+                zarr_path=Path(self.path), element_name=element_name, use_consolidated=False
             )
 
             from spatialdata._io._utils import overwrite_channel_names
@@ -1604,8 +1610,6 @@ class SpatialData:
         element_name
             The name of the element to write. If None, write the transformations of all elements.
         """
-        from spatialdata._io.io_zarr import _get_groups_for_element
-
         if element_name is not None:
             check_valid_name(element_name)
             if element_name not in self:
@@ -1629,9 +1633,10 @@ class SpatialData:
 
         # Mypy does not understand that path is not None so we have a conditional
         assert self.path is not None
-        _, _, element_group = _get_groups_for_element(
+        from spatialdata._io.io_zarr import _get_flat_element_group
+
+        element_group = _get_flat_element_group(
             zarr_path=Path(self.path),
-            element_type=element_type,
             element_name=element_name,
             use_consolidated=False,
         )
@@ -1660,21 +1665,7 @@ class SpatialData:
             raise ValueError(f"Unknown element type {type(element)}")
 
     def _element_type_from_element_name(self, element_name: str) -> str:
-        self._validate_element_names_are_unique()
-        element = self.get(element_name)
-        if element is None:
-            raise ValueError(f"Element with name {element_name} not found in SpatialData object.")
-
-        located = self.locate_element(element)
-        element_type = None
-        for path in located:
-            found_element_type, found_element_name = path.split("/")
-            if element_name == found_element_name:
-                element_type = found_element_type
-                break
-        if element_type is None:
-            pass
-        assert element_type is not None
+        element_type, _, _ = self._find_element(element_name)
         return element_type
 
     def _element_type_and_name_from_element_path(self, element_path: str) -> tuple[str, str]:
@@ -1700,7 +1691,8 @@ class SpatialData:
             store = _resolve_zarr_store(self.path)
             zarr_group = zarr.open_group(store=store, mode="r+")
 
-        version = sdata_format.spatialdata_format_version
+        # Use "0.3" for the new flat/hierarchical layout
+        version = "0.3"
         version_specific_attrs = sdata_format.attrs_to_dict()
         attrs_to_write = {"spatialdata_attrs": {"version": version} | version_specific_attrs} | self.attrs
 
@@ -1842,7 +1834,7 @@ class SpatialData:
         raise ValueError(f"Invalid 'return_as' value: {return_as}. Expected 'dict', 'json', 'df', or None.")
 
     @property
-    def tables(self) -> Tables:
+    def tables(self) -> dict[str, AnnData]:
         """
         Return tables dictionary.
 
@@ -1852,16 +1844,16 @@ class SpatialData:
             Either the empty dictionary or a dictionary with as values the strings representing the table names and
             as values the AnnData tables themselves.
         """
-        return self._tables
+        return {k: v for k, v in self._elements.items() if get_model(v) == TableModel}  # type: ignore[return-value]
 
     @tables.setter
     def tables(self, tables: dict[str, AnnData]) -> None:
         """Set tables."""
-        self._shared_keys = self._shared_keys - set(self._tables.keys())
-        self._tables = Tables(shared_keys=self._shared_keys)
+        for k in list(self.tables.keys()):
+            del self._elements[k]
         for k, v in tables.items():
             TableModel.validate(v)
-            self._tables[k] = v
+            self._elements[k] = v
 
     @staticmethod
     def read(
@@ -1895,56 +1887,56 @@ class SpatialData:
         return read_zarr(file_path, selection=selection)
 
     @property
-    def images(self) -> Images:
+    def images(self) -> dict[str, Raster_T]:
         """Return images as a Dict of name to image data."""
-        return self._images
+        return {k: v for k, v in self._elements.items() if get_model(v) in (Image2DModel, Image3DModel)}  # type: ignore[return-value]
 
     @images.setter
     def images(self, images: dict[str, Raster_T]) -> None:
         """Set images."""
-        self._shared_keys = self._shared_keys - set(self._images.keys())
-        self._images = Images(shared_keys=self._shared_keys)
+        for k in list(self.images.keys()):
+            del self._elements[k]
         for k, v in images.items():
-            self._images[k] = v
+            self._elements[k] = v
 
     @property
-    def labels(self) -> Labels:
+    def labels(self) -> dict[str, Raster_T]:
         """Return labels as a Dict of name to label data."""
-        return self._labels
+        return {k: v for k, v in self._elements.items() if get_model(v) in (Labels2DModel, Labels3DModel)}  # type: ignore[return-value]
 
     @labels.setter
     def labels(self, labels: dict[str, Raster_T]) -> None:
         """Set labels."""
-        self._shared_keys = self._shared_keys - set(self._labels.keys())
-        self._labels = Labels(shared_keys=self._shared_keys)
+        for k in list(self.labels.keys()):
+            del self._elements[k]
         for k, v in labels.items():
-            self._labels[k] = v
+            self._elements[k] = v
 
     @property
-    def points(self) -> Points:
+    def points(self) -> dict[str, DaskDataFrame]:
         """Return points as a Dict of name to point data."""
-        return self._points
+        return {k: v for k, v in self._elements.items() if get_model(v) == PointsModel}  # type: ignore[return-value]
 
     @points.setter
     def points(self, points: dict[str, DaskDataFrame]) -> None:
         """Set points."""
-        self._shared_keys = self._shared_keys - set(self._points.keys())
-        self._points = Points(shared_keys=self._shared_keys)
+        for k in list(self.points.keys()):
+            del self._elements[k]
         for k, v in points.items():
-            self._points[k] = v
+            self._elements[k] = v
 
     @property
-    def shapes(self) -> Shapes:
+    def shapes(self) -> dict[str, GeoDataFrame]:
         """Return shapes as a Dict of name to shape data."""
-        return self._shapes
+        return {k: v for k, v in self._elements.items() if get_model(v) == ShapesModel}  # type: ignore[return-value]
 
     @shapes.setter
     def shapes(self, shapes: dict[str, GeoDataFrame]) -> None:
         """Set shapes."""
-        self._shared_keys = self._shared_keys - set(self._shapes.keys())
-        self._shapes = Shapes(shared_keys=self._shared_keys)
+        for k in list(self.shapes.keys()):
+            del self._elements[k]
         for k, v in shapes.items():
-            self._shapes[k] = v
+            self._elements[k] = v
 
     @property
     def coordinate_systems(self) -> list[str]:
@@ -1987,118 +1979,102 @@ class SpatialData:
         -------
             The string representation of the SpatialData object.
         """
+        from collections import defaultdict
+
         from spatialdata._utils import _natural_keys
+        from spatialdata.transformations.operations import get_transformation
 
-        def rreplace(s: str, old: str, new: str, occurrence: int) -> str:
-            li = s.rsplit(old, occurrence)
-            return new.join(li)
-
-        def h(s: str) -> str:
-            return hashlib.md5(repr(s).encode()).hexdigest()
+        def _format_element(elem_name: str, elem: SpatialElement | AnnData) -> str:
+            model = get_model(elem)
+            if model in (Image2DModel, Image3DModel):
+                tag = "Image2D" if model == Image2DModel else "Image3D"
+                if isinstance(elem, DataArray):
+                    return f"[{tag}] {elem.__class__.__name__}[{''.join(elem.dims)}] {elem.shape}"
+                else:
+                    assert isinstance(elem, DataTree)
+                    shapes = []
+                    dims = None
+                    for pyramid_level in elem:
+                        dataset_names = list(elem[pyramid_level].keys())
+                        assert len(dataset_names) == 1
+                        ds = elem[pyramid_level][dataset_names[0]]
+                        shapes.append(ds.shape)
+                        if dims is None:
+                            dims = "".join(ds.dims)
+                    return f"[{tag}] {elem.__class__.__name__}[{dims}] {', '.join(map(str, shapes))}"
+            elif model in (Labels2DModel, Labels3DModel):
+                tag = "Labels2D" if model == Labels2DModel else "Labels3D"
+                if isinstance(elem, DataArray):
+                    return f"[{tag}] {elem.__class__.__name__}[{''.join(elem.dims)}] {elem.shape}"
+                else:
+                    assert isinstance(elem, DataTree)
+                    shapes = []
+                    dims = None
+                    for pyramid_level in elem:
+                        dataset_names = list(elem[pyramid_level].keys())
+                        assert len(dataset_names) == 1
+                        ds = elem[pyramid_level][dataset_names[0]]
+                        shapes.append(ds.shape)
+                        if dims is None:
+                            dims = "".join(ds.dims)
+                    return f"[{tag}] {elem.__class__.__name__}[{dims}] {', '.join(map(str, shapes))}"
+            elif model == PointsModel:
+                n = len(get_axes_names(elem))
+                return f"[Points{n}D] {elem.__class__.__name__} {elem.shape}"
+            elif model == ShapesModel:
+                return f"[Shapes] {elem.__class__.__name__} {elem.shape}"  # type: ignore[union-attr]
+            elif model == TableModel:
+                assert isinstance(elem, AnnData)
+                return f"[Table] AnnData {elem.shape}"
+            return f"[Unknown] {elem.__class__.__name__}"
 
         descr = "SpatialData object"
         if self.path is not None:
-            descr += f", with associated Zarr store: {self.path.resolve()}"
+            descr += f" at {self.path.resolve()}"
 
-        non_empty_elements = self._non_empty_elements()
-        last_element_index = len(non_empty_elements) - 1
-        for attr_index, attr in enumerate(non_empty_elements):
-            last_attr = attr_index == last_element_index
-            attribute = getattr(self, attr)
+        # Split elements: flat (no "/") vs grouped by first path component
+        tree: dict[str, list[tuple[str, Any]]] = defaultdict(list)
+        flat: list[tuple[str, Any]] = []
 
-            descr += f"\n{h('level0')}{attr.capitalize()}"
-
-            unsorted_elements = attribute.items()
-            sorted_elements = sorted(unsorted_elements, key=lambda x: _natural_keys(x[0]))
-            for k, v in sorted_elements:
-                descr += f"{h('empty_line')}"
-                descr_class = v.__class__.__name__
-                if attr == "shapes":
-                    descr += f"{h(attr + 'level1.1')}{k!r}: {descr_class} shape: {v.shape} (2D shapes)"
-                elif attr == "points":
-                    import pyarrow.parquet as pq
-
-                    from spatialdata._io._utils import get_dask_backing_files
-
-                    length: int | None = None
-                    backing_files = get_dask_backing_files(v)
-                    if backing_files:
-                        length = sum(pq.read_metadata(f).num_rows for f in backing_files)
-
-                    n = len(get_axes_names(v))
-                    dim_string = f"({n}D points)"
-
-                    assert len(v.shape) == 2
-                    if length is not None:
-                        shape_str = f"({length}, {v.shape[1]})"
-                    else:
-                        shape_str = (
-                            "("
-                            + ", ".join([(str(dim) if not isinstance(dim, Scalar) else "<Delayed>") for dim in v.shape])
-                            + ")"
-                        )
-                    descr += f"{h(attr + 'level1.1')}{k!r}: {descr_class} with shape: {shape_str} {dim_string}"
-                elif attr == "tables":
-                    descr += f"{h(attr + 'level1.1')}{k!r}: {descr_class} {v.shape}"
-                else:
-                    if isinstance(v, DataArray):
-                        descr += f"{h(attr + 'level1.1')}{k!r}: {descr_class}[{''.join(v.dims)}] {v.shape}"
-                    elif isinstance(v, DataTree):
-                        shapes = []
-                        dims: str | None = None
-                        for pyramid_level in v:
-                            dataset_names = list(v[pyramid_level].keys())
-                            assert len(dataset_names) == 1
-                            dataset_name = dataset_names[0]
-                            vv = v[pyramid_level][dataset_name]
-                            shape = vv.shape
-                            if dims is None:
-                                dims = "".join(vv.dims)
-                            shapes.append(shape)
-                        descr += f"{h(attr + 'level1.1')}{k!r}: {descr_class}[{dims}] {', '.join(map(str, shapes))}"
-                    else:
-                        raise TypeError(f"Unknown type {type(v)}")
-            if last_attr is True:
-                descr = descr.replace(h("empty_line"), "\n  ")
+        for name, elem in sorted(self._elements.items(), key=lambda x: _natural_keys(x[0])):
+            parts = name.split("/", 1)
+            if len(parts) == 1:
+                flat.append((name, elem))
             else:
-                descr = descr.replace(h("empty_line"), "\n│ ")
+                tree[parts[0]].append((parts[1], elem))
 
-        descr = rreplace(descr, h("level0"), "└── ", 1)
-        descr = descr.replace(h("level0"), "├── ")
+        # Build ordered list of entries: flat elements first, then grouped
+        folder_keys = sorted(tree.keys(), key=_natural_keys)
+        all_entries: list[tuple[str, Any]] = flat + [(k, tree[k]) for k in folder_keys]
 
-        for attr in ["images", "labels", "points", "tables", "shapes"]:
-            descr = rreplace(descr, h(attr + "level1.1"), "    └── ", 1)
-            descr = descr.replace(h(attr + "level1.1"), "    ├── ")
+        for i, entry in enumerate(all_entries):
+            is_last = i == len(all_entries) - 1
+            branch = "└──" if is_last else "├──"
+            child_indent = "    " if is_last else "│   "
 
-        from spatialdata.transformations.operations import get_transformation
+            if isinstance(entry[1], list):
+                folder, children = entry[0], entry[1]
+                descr += f"\n{branch} {folder}/ ({len(children)} element{'s' if len(children) != 1 else ''})"
+                for j, (child_name, child_elem) in enumerate(children):
+                    child_branch = "└──" if j == len(children) - 1 else "├──"
+                    descr += f"\n{child_indent}{child_branch} {child_name}: {_format_element(child_name, child_elem)}"
+            else:
+                name, elem = entry
+                descr += f"\n{branch} {name}: {_format_element(name, elem)}"
 
+        # Coordinate systems
         descr += "\nwith coordinate systems:\n"
-        coordinate_systems = self.coordinate_systems.copy()
-        coordinate_systems.sort(key=_natural_keys)
+        coordinate_systems = sorted(self.coordinate_systems, key=_natural_keys)
         for i, cs in enumerate(coordinate_systems):
             descr += f"    ▸ {cs!r}"
-            gen = self._gen_elements()
-            elements_in_cs: dict[str, list[str]] = {}
-            for k, name, obj in gen:
-                if not isinstance(obj, AnnData):
-                    transformations = get_transformation(obj, get_all=True)
-                    assert isinstance(transformations, dict)
-                    target_css = transformations.keys()
-                    if cs in target_css:
-                        if k not in elements_in_cs:
-                            elements_in_cs[k] = []
-                        elements_in_cs[k].append(name)
-            for element_names in elements_in_cs.values():
-                element_names.sort(key=_natural_keys)
-            if len(elements_in_cs) > 0:
-                elements = ", ".join(
-                    [
-                        f"{element_name} ({element_type.capitalize()})"
-                        for element_type, element_names in elements_in_cs.items()
-                        for element_name in element_names
-                    ]
-                )
-                descr += f", with elements:\n        {elements}"
+            elements_in_cs: list[str] = []
+            for _, element_name, obj in self._gen_elements():
+                transformations = get_transformation(obj, get_all=True)
+                assert isinstance(transformations, dict)
+                if cs in transformations:
+                    elements_in_cs.append(element_name)
+            if elements_in_cs:
+                descr += f", with elements:\n        {', '.join(sorted(elements_in_cs, key=_natural_keys))}"
             if i < len(coordinate_systems) - 1:
                 descr += "\n"
 
@@ -2139,9 +2115,9 @@ class SpatialData:
             A generator that yields spatial element objects contained in the SpatialData instance.
 
         """
-        for element_type in ["images", "labels", "points", "shapes"]:
-            d = getattr(SpatialData, element_type).fget(self)
-            yield from d.values()
+        for k, v in self._elements.items():
+            if not isinstance(v, AnnData):
+                yield v  # type: ignore[misc]
 
     def _gen_elements(
         self, include_tables: bool = False
@@ -2159,13 +2135,23 @@ class SpatialData:
         A generator object that returns a tuple containing the type of the element, its name, and the element
         itself.
         """
-        element_types = ["images", "labels", "points", "shapes"]
-        if include_tables:
-            element_types.append("tables")
-        for element_type in element_types:
-            d = getattr(SpatialData, element_type).fget(self)
-            for k, v in d.items():
-                yield element_type, k, v
+        for element_name, element in self._elements.items():
+            model = get_model(element)
+            if model in (Image2DModel, Image3DModel):
+                element_type = "images"
+            elif model in (Labels2DModel, Labels3DModel):
+                element_type = "labels"
+            elif model == PointsModel:
+                element_type = "points"
+            elif model == ShapesModel:
+                element_type = "shapes"
+            elif model == TableModel:
+                element_type = "tables"
+            else:
+                continue
+            if element_type == "tables" and not include_tables:
+                continue
+            yield element_type, element_name, element
 
     def gen_spatial_elements(
         self,
@@ -2229,10 +2215,7 @@ class SpatialData:
         KeyError
             If the element with the given name cannot be found.
         """
-        found = []
-        for element_type, element_name_, element in self.gen_elements():
-            if element_name_ == element_name:
-                found.append((element_type, element_name_, element))
+        found = [(et, en, el) for et, en, el in self.gen_elements() if en == element_name]
 
         if len(found) == 0:
             raise KeyError(f"Could not find element with name {element_name!r}")
@@ -2262,22 +2245,7 @@ class SpatialData:
         -------
         The SpatialData object.
         """
-        elements_dict: dict[str, SpatialElement | AnnData] = {}
-        for name, element in elements.items():
-            model = get_model(element)
-            if model in [Image2DModel, Image3DModel]:
-                element_type = "images"
-            elif model in [Labels2DModel, Labels3DModel]:
-                element_type = "labels"
-            elif model == PointsModel:
-                element_type = "points"
-            elif model == TableModel:
-                element_type = "tables"
-            else:
-                assert model == ShapesModel
-                element_type = "shapes"
-            elements_dict.setdefault(element_type, {})[name] = element
-        return cls(**elements_dict, attrs=attrs)
+        return cls(elements=elements, attrs=attrs)
 
     def subset(
         self,
@@ -2304,12 +2272,12 @@ class SpatialData:
         -------
         The subsetted SpatialData object.
         """
-        elements_dict: dict[str, SpatialElement] = {}
+        flat_elements: dict[str, SpatialElement | AnnData] = {}
         names_tables_to_keep: set[str] = set()
         for element_type, element_name, element in self._gen_elements(include_tables=True):
             if element_name in element_names:
                 if element_type != "tables":
-                    elements_dict.setdefault(element_type, {})[element_name] = element
+                    flat_elements[element_name] = element
                 else:
                     names_tables_to_keep.add(element_name)
         tables = self._filter_tables(
@@ -2317,33 +2285,44 @@ class SpatialData:
             filter_tables,
             "elements",
             include_orphan_tables,
-            elements_dict=elements_dict,
+            elements_dict=flat_elements,
         )
-        return SpatialData(**elements_dict, tables=tables, attrs=self.attrs)
+        all_elements = {**flat_elements, **tables}
+        return SpatialData(elements=all_elements, attrs=self.attrs)
 
-    def __getitem__(self, item: str) -> SpatialElement | AnnData:
+    def __getitem__(self, item: str) -> SpatialElement | AnnData | SpatialData:
         """
-        Return the element with the given name.
+        Return the element with the given name, or a sub-SpatialData view for a path prefix.
 
         Parameters
         ----------
         item
-            The name of the element to return.
+            The name of the element to return, or a path prefix (e.g. "sample1") to get a sub-view.
 
         Returns
         -------
-        The element.
+        The element, or a sub-SpatialData containing all elements under the prefix.
         """
-        _, _, element = self._find_element(item)
-        return element
+        # Exact match first
+        if item in self._elements:
+            return self._elements[item]
+        # Prefix match — return sub-SpatialData view
+        prefix = item.rstrip("/") + "/"
+        sub_elements = {k[len(prefix):]: v for k, v in self._elements.items() if k.startswith(prefix)}
+        if sub_elements:
+            sub = SpatialData(elements=sub_elements)
+            if self._path is not None:
+                sub._path = self._path / item
+            return sub
+        raise KeyError(f"Could not find element or group with name {item!r}")
 
     def __contains__(self, key: str) -> bool:
-        element_dict = {
-            element_name: element_value for _, element_name, element_value in self._gen_elements(include_tables=True)
-        }
-        return key in element_dict
+        if key in self._elements:
+            return True
+        prefix = key.rstrip("/") + "/"
+        return any(k.startswith(prefix) for k in self._elements)
 
-    def get(self, key: str, default_value: SpatialElement | AnnData | None = None) -> SpatialElement | AnnData | None:
+    def get(self, key: str, default_value: SpatialElement | AnnData | SpatialData | None = None) -> SpatialElement | AnnData | SpatialData | None:
         """
         Get element from SpatialData object based on corresponding name.
 
@@ -2358,10 +2337,9 @@ class SpatialData:
         -------
         The SpatialData element associated with the given key, if found. Otherwise, the default value is returned.
         """
-        for _, element_name_, element in self.gen_elements():
-            if element_name_ == key:
-                return element
-        else:
+        try:
+            return self[key]
+        except KeyError:
             return default_value
 
     def __setitem__(self, key: str, value: SpatialElement | AnnData) -> None:
@@ -2371,23 +2349,27 @@ class SpatialData:
         Parameters
         ----------
         key
-            The name of the element.
+            The name of the element. May contain "/" for hierarchical paths (e.g. "sample1/image").
         value
             The element.
         """
-        schema = get_model(value)
-        if schema in (Image2DModel, Image3DModel):
-            self.images[key] = value
-        elif schema in (Labels2DModel, Labels3DModel):
-            self.labels[key] = value
-        elif schema == PointsModel:
-            self.points[key] = value
-        elif schema == ShapesModel:
-            self.shapes[key] = value
-        elif schema == TableModel:
-            self.tables[key] = value
+        # Validate each path component individually
+        for component in key.split("/"):
+            check_valid_name(component)
+        model = get_model(value)
+        if model == TableModel:
+            TableModel.validate(value)
+        elif model in (Image2DModel, Image3DModel):
+            pass  # model already validates on parse
+        elif model in (Labels2DModel, Labels3DModel):
+            pass
+        elif model == PointsModel:
+            pass
+        elif model == ShapesModel:
+            pass
         else:
-            raise TypeError(f"Unknown element type with schema: {schema!r}.")
+            raise TypeError(f"Unknown element type with schema: {model!r}.")
+        self._elements[key] = value
 
     def __delitem__(self, key: str) -> None:
         """
@@ -2396,10 +2378,18 @@ class SpatialData:
         Parameters
         ----------
         key
-            The name of the element to delete.
+            The name of the element to delete, or a path prefix to delete a group of elements.
         """
-        element_type, _, _ = self._find_element(key)
-        getattr(self, element_type).__delitem__(key)
+        if key in self._elements:
+            del self._elements[key]
+            return
+        # Delete prefix group
+        prefix = key.rstrip("/") + "/"
+        keys_to_delete = [k for k in self._elements if k.startswith(prefix)]
+        if not keys_to_delete:
+            raise KeyError(f"Could not find element or group with name {key!r}")
+        for k in keys_to_delete:
+            del self._elements[k]
 
     @property
     def attrs(self) -> dict[Any, Any]:

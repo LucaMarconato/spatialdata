@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from collections.abc import Callable
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,8 +16,10 @@ import pyarrow.parquet as pq
 import pytest
 import zarr
 from anndata import AnnData
+from anndata.io import read_elem
 from numpy.random import default_rng
 from packaging.version import Version
+from pandas.testing import assert_series_equal
 from shapely import MultiPolygon, Polygon
 from upath import UPath
 from xarray import DataArray
@@ -55,6 +58,7 @@ RNG = default_rng(0)
 SDATA_FORMATS = list(SpatialDataContainerFormats.values())
 
 
+@pytest.mark.filterwarnings("ignore:SpatialData is not stored in the most current format:UserWarning")
 @pytest.mark.parametrize("sdata_container_format", SDATA_FORMATS)
 class TestReadWrite:
     def test_images(
@@ -243,6 +247,78 @@ class TestReadWrite:
         sdata2.write(tmpdir2, sdata_formats=sdata_container_format)
         _are_directories_identical(tmpdir, tmpdir2, exclude_regexp="[1-9][0-9]*.*")
 
+    def test_compression_roundtrip(
+        self,
+        tmp_path: str,
+        full_sdata: SpatialData,
+        sdata_container_format: SpatialDataContainerFormatType,
+    ):
+        tmpdir = Path(tmp_path) / "tmp.zarr"
+        with pytest.raises(TypeError, match="Expected a dictionary with as"):
+            full_sdata.write(tmpdir, raster_compressor="faulty", sdata_formats=sdata_container_format)
+        with pytest.raises(ValueError, match="Expected a dictionary with a single"):
+            full_sdata.write(
+                tmpdir, raster_compressor={"zstd": 8, "other_item": 4}, sdata_formats=sdata_container_format
+            )
+        with pytest.raises(ValueError, match="Compression must either"):
+            full_sdata.write(tmpdir, raster_compressor={"faulty": 8}, sdata_formats=sdata_container_format)
+        with pytest.raises(ValueError, match="Compression must either"):
+            full_sdata.write(
+                tmpdir, raster_compressor={"The compression level": 10}, sdata_formats=sdata_container_format
+            )
+
+        full_sdata.write(tmpdir, raster_compressor={"zstd": 8}, sdata_formats=sdata_container_format)
+
+        # sourcery skip: no-loop-in-tests
+        for element in ["image2d", "image2d_multiscale", "labels2d", "labels2d_multiscale"]:
+            element_type = "images" if element.startswith("image") else "labels"
+            arr = zarr.open_group(tmpdir / element_type, mode="r")[element]["s0"]
+            compressor = arr.compressors[0]
+
+            if sdata_container_format.zarr_format == 2:
+                assert compressor.cname == "zstd"
+                assert compressor.clevel == 8
+            elif sdata_container_format.zarr_format == 3:
+                from zarr.codecs.zstd import ZstdCodec
+
+                assert isinstance(compressor, ZstdCodec)
+                assert compressor.level == 8
+
+    @pytest.mark.parametrize("raster_compressor", [{"lz4": 3}, {"zstd": 7}])
+    @pytest.mark.parametrize("element", [("images", "image2d"), ("labels", "labels2d")])
+    def test_write_element_compression(
+        self,
+        tmp_path: str,
+        full_sdata: SpatialData,
+        raster_compressor: dict[Literal["lz4", "zstd"], int],
+        element: str,
+        sdata_container_format: SpatialDataContainerFormatType,
+    ):
+        tmpdir = Path(tmp_path) / "compression.zarr"
+        sdata = SpatialData()
+        sdata.write(tmpdir, sdata_formats=sdata_container_format)
+
+        sdata["element"] = full_sdata[element[1]]
+        sdata.write_element("element", raster_compressor=raster_compressor, sdata_formats=sdata_container_format)
+
+        arr = zarr.open_group(tmpdir / element[0], mode="r")["element"]["s0"]
+        compression = arr.compressors[0]
+
+        if sdata_container_format.zarr_format == 2:
+            assert compression.cname == list(raster_compressor.keys())[0]
+            assert compression.clevel == list(raster_compressor.values())[0]
+        elif sdata_container_format.zarr_format == 3:
+            from zarr.codecs import BloscCodec, ZstdCodec
+
+            compressor_name = list(raster_compressor.keys())[0]
+            compressor_level = list(raster_compressor.values())[0]
+            if compressor_name == "zstd":
+                assert isinstance(compression, ZstdCodec)
+                assert compression.level == compressor_level
+            elif compressor_name == "lz4":
+                assert isinstance(compression, BloscCodec)
+                assert compression.clevel == compressor_level
+
     def test_incremental_io_list_of_elements(
         self,
         shapes: SpatialData,
@@ -329,11 +405,7 @@ class TestReadWrite:
 
         In particular the complex "dask-backed" case for workaround 1 could be simplified once
         """
-        tmpdir = Path(tmp_path) / "incremental_io.zarr"
-        sdata = SpatialData()
-        sdata.write(tmpdir, sdata_formats=sdata_container_format)
-
-        for name in [
+        _elements = [
             "image2d",
             "image3d_multiscale_xarray",
             "labels2d",
@@ -341,7 +413,15 @@ class TestReadWrite:
             "points_0",
             "multipoly",
             "table",
-        ]:
+        ]
+        # Reduce to only the elements under test so the fixture deepcopy stays small.
+        full_sdata = full_sdata.subset(_elements)
+
+        tmpdir = Path(tmp_path) / "incremental_io.zarr"
+        sdata = SpatialData()
+        sdata.write(tmpdir, sdata_formats=sdata_container_format)
+
+        for name in _elements:
             sdata[name] = full_sdata[name]
             sdata.write_element(name, sdata_formats=sdata_container_format)
             if dask_backed:
@@ -514,25 +594,25 @@ class TestReadWrite:
                 ):
                     full_sdata.write(f, overwrite=True, sdata_formats=sdata_container_format)
 
-    def test_overwrite_fails_when_zarr_store_present(
-        self, full_sdata, sdata_container_format: SpatialDataContainerFormatType
-    ):
+    def test_overwrite_fails_when_zarr_store_present(self, sdata_container_format: SpatialDataContainerFormatType):
         # addressing https://github.com/scverse/spatialdata/issues/137
         with tempfile.TemporaryDirectory() as tmpdir:
             f = os.path.join(tmpdir, "data.zarr")
-            full_sdata.write(f, sdata_formats=sdata_container_format)
+            # An empty store is enough to trigger both exceptions.
+            sdata = SpatialData()
+            sdata.write(f, sdata_formats=sdata_container_format)
 
             with pytest.raises(
                 ValueError,
                 match="The Zarr store already exists. Use `overwrite=True` to try overwriting the store.",
             ):
-                full_sdata.write(f, sdata_formats=sdata_container_format)
+                sdata.write(f, sdata_formats=sdata_container_format)
 
             with pytest.raises(
                 ValueError,
                 match=r"Details: the target path either contains, coincides or is contained in the current Zarr store",
             ):
-                full_sdata.write(f, overwrite=True, sdata_formats=sdata_container_format)
+                sdata.write(f, overwrite=True, sdata_formats=sdata_container_format)
 
         # support for overwriting backed sdata has been temporarily removed
         # with tempfile.TemporaryDirectory() as tmpdir:
@@ -606,6 +686,24 @@ def test_incremental_io_in_memory(
         sdata.tables[f"additional_{k}"] = v
         with pytest.raises(KeyError, match="Key `poly` is not unique"):
             sdata["poly"] = v
+
+
+def test_table_group_keeps_anndata_encoding_metadata(tmp_path: str, table_single_annotation: SpatialData) -> None:
+    # https://github.com/scverse/spatialdata/issues/1183
+    # Writing the spatialdata attributes on the table group must not erase the
+    # `encoding-type`/`encoding-version` metadata that anndata writes on the same
+    # group; anndata-level readers (read_elem, read_lazy) dispatch on it.
+    tmpdir = Path(tmp_path) / "tmp.zarr"
+    table_single_annotation.write(tmpdir)
+
+    on_disk = json.loads((tmpdir / "tables" / "table" / "zarr.json").read_text())["attributes"]
+    assert on_disk["encoding-type"] == "anndata"
+    assert on_disk["encoding-version"] == "0.1.0"
+    # the spatialdata attributes must be present alongside, not instead
+    assert on_disk["spatialdata-encoding-type"] == "ngff:regions_table"
+
+    table_group = zarr.open_group(tmpdir, mode="r")["tables/table"]
+    assert isinstance(read_elem(table_group), AnnData)
 
 
 def test_bug_rechunking_after_queried_raster():
@@ -743,8 +841,13 @@ def test_single_scale_image_roundtrip_stays_dataarray(tmp_path: Path) -> None:
     assert list(image_group.keys()) == ["s0"]
 
 
+@pytest.mark.filterwarnings("ignore:SpatialData is not stored in the most current format:UserWarning")
 @pytest.mark.parametrize("sdata_container_format", SDATA_FORMATS)
 def test_self_contained(full_sdata: SpatialData, sdata_container_format: SpatialDataContainerFormatType) -> None:
+    # image2d/labels2d/points_0 are used explicitly in the combined-element block below;
+    # circles covers the "else: assert self_contained" branch (non-dask-backed elements).
+    full_sdata = full_sdata.subset(["image2d", "labels2d", "points_0", "circles"])
+
     # data only in-memory, so the SpatialData object and all its elements are self-contained
     assert full_sdata.is_self_contained()
     description = full_sdata.elements_are_self_contained()
@@ -804,6 +907,7 @@ def test_self_contained(full_sdata: SpatialData, sdata_container_format: Spatial
         assert all(description[element_name] for element_name in description if element_name != "combined")
 
 
+@pytest.mark.filterwarnings("ignore:SpatialData is not stored in the most current format:UserWarning")
 @pytest.mark.parametrize("sdata_container_format", SDATA_FORMATS)
 def test_symmetric_difference_with_zarr_store(
     full_sdata: SpatialData, sdata_container_format: SpatialDataContainerFormatType
@@ -846,9 +950,12 @@ def test_symmetric_difference_with_zarr_store(
         }
 
 
+@pytest.mark.filterwarnings("ignore:SpatialData is not stored in the most current format:UserWarning")
 @pytest.mark.parametrize("sdata_container_format", SDATA_FORMATS)
 def test_change_path_of_subset(full_sdata: SpatialData, sdata_container_format: SpatialDataContainerFormatType) -> None:
     """A subset SpatialData object has not Zarr path associated, show that we can reassign the path"""
+    # points_0_1 is the extra element that stays only on disk, satisfying the only_on_disk > 0 assertion.
+    full_sdata = full_sdata.subset(["image2d", "labels2d", "points_0", "circles", "table", "points_0_1"])
     with tempfile.TemporaryDirectory() as tmpdir:
         f = os.path.join(tmpdir, "data.zarr")
         full_sdata.write(f, sdata_formats=sdata_container_format)
@@ -917,6 +1024,7 @@ def test_incremental_io_valid_name(full_sdata: SpatialData) -> None:
     _check_valid_name(full_sdata.write_transformations)
 
 
+@pytest.mark.filterwarnings("ignore:SpatialData is not stored in the most current format:UserWarning")
 @pytest.mark.parametrize("sdata_container_format", SDATA_FORMATS)
 def test_incremental_io_attrs(points: SpatialData, sdata_container_format: SpatialDataContainerFormatType) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -942,9 +1050,12 @@ def test_incremental_io_attrs(points: SpatialData, sdata_container_format: Spati
         assert sdata2.attrs["c"] == 3
 
 
-cached_sdata_blobs = blobs()
+@pytest.fixture(scope="module")
+def _cached_sdata_blobs():
+    return blobs()
 
 
+@pytest.mark.filterwarnings("ignore:SpatialData is not stored in the most current format:UserWarning")
 @pytest.mark.parametrize("element_name", ["image2d", "labels2d", "points_0", "circles", "table"])
 @pytest.mark.parametrize("sdata_container_format", SDATA_FORMATS)
 def test_delete_element_from_disk(
@@ -952,6 +1063,9 @@ def test_delete_element_from_disk(
     element_name: str,
     sdata_container_format: SpatialDataContainerFormatType,
 ) -> None:
+    # Reduce to only the element under test plus one extra to keep writes fast.
+    full_sdata = full_sdata.subset([element_name, "points_0_1"])
+
     # can't delete an element for a SpatialData object without associated Zarr store
     with pytest.raises(ValueError, match="The SpatialData object is not backed by a Zarr store."):
         full_sdata.delete_element_from_disk("image2d")
@@ -996,10 +1110,12 @@ def test_delete_element_from_disk(
         assert element_path not in on_disk
 
 
+@pytest.mark.filterwarnings("ignore:SpatialData is not stored in the most current format:UserWarning")
 @pytest.mark.parametrize("element_name", ["image2d", "labels2d", "points_0", "circles", "table"])
 @pytest.mark.parametrize("sdata_container_format", SDATA_FORMATS)
 def test_element_already_on_disk_different_type(
     full_sdata,
+    _cached_sdata_blobs,
     element_name: str,
     sdata_container_format: SpatialDataContainerFormatType,
 ) -> None:
@@ -1007,6 +1123,8 @@ def test_element_already_on_disk_different_type(
     # Attempting to perform and IO operation will trigger an error.
     # The checks assessed in this test will not be needed anymore after
     # https://github.com/scverse/spatialdata/issues/504 is addressed
+    # Only the single element under test needs to be on disk to create the type-mismatch state.
+    full_sdata = full_sdata.subset([element_name])
     with tempfile.TemporaryDirectory() as tmpdir:
         f = os.path.join(tmpdir, "data.zarr")
         full_sdata.write(f, sdata_formats=sdata_container_format)
@@ -1015,7 +1133,7 @@ def test_element_already_on_disk_different_type(
         wrong_group = "images" if element_type == "tables" else "tables"
         del getattr(full_sdata, element_type)[element_name]
         getattr(full_sdata, wrong_group)[element_name] = (
-            getattr(cached_sdata_blobs, wrong_group).values().__iter__().__next__()
+            getattr(_cached_sdata_blobs, wrong_group).values().__iter__().__next__()
         )
         ERROR_MSG = "The in-memory object should have a different name."
 
@@ -1127,6 +1245,7 @@ def test_reading_invalid_name(tmp_path: Path):
     )
 
 
+@pytest.mark.filterwarnings("ignore:SpatialData is not stored in the most current format:UserWarning")
 @pytest.mark.parametrize("sdata_container_format", SDATA_FORMATS)
 def test_write_store_unconsolidated_and_read(full_sdata, sdata_container_format: SpatialDataContainerFormatType):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1139,6 +1258,7 @@ def test_write_store_unconsolidated_and_read(full_sdata, sdata_container_format:
         assert_spatial_data_objects_are_identical(full_sdata, second_read)
 
 
+@pytest.mark.filterwarnings("ignore:SpatialData is not stored in the most current format:UserWarning")
 @pytest.mark.parametrize("sdata_container_format", SDATA_FORMATS)
 def test_can_read_sdata_with_reconsolidation(full_sdata, sdata_container_format: SpatialDataContainerFormatType):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1190,13 +1310,13 @@ def test_read_sdata(tmp_path: Path, points: SpatialData) -> None:
     assert_spatial_data_objects_are_identical(sdata_from_path, sdata_from_zarr_group)
 
 
-def test_sdata_with_nan_in_obs(tmp_path: Path) -> None:
+@pytest.mark.parametrize("convert_strings_to_categoricals", (True, False))
+def test_sdata_with_nan_in_obs(tmp_path: Path, convert_strings_to_categoricals: bool) -> None:
     """Test writing SpatialData with mixed string/NaN values in obs works correctly.
 
     Regression test for https://github.com/scverse/spatialdata/issues/399
     Previously this raised TypeError: expected unicode string, found nan.
-    Now the write succeeds, though NaN values in object-dtype columns are
-    converted to the string "nan" after round-trip.
+    Now the write succeeds, and NaN values are preserved round trip
     """
     from spatialdata.models import TableModel
 
@@ -1208,7 +1328,8 @@ def test_sdata_with_nan_in_obs(tmp_path: Path) -> None:
                     "instance": [0, 0],
                     "column_only_region1": ["string", np.nan],
                     "column_only_region2": [np.nan, 3],
-                }
+                },
+                index=["0", "1"],
             )
         ),
         region_key="region",
@@ -1219,8 +1340,17 @@ def test_sdata_with_nan_in_obs(tmp_path: Path) -> None:
     assert sdata["table"].obs["column_only_region1"].iloc[1] is np.nan
     assert np.isnan(sdata["table"].obs["column_only_region2"].iloc[0])
 
+    dtypes_before_writing = sdata["table"].obs.dtypes.copy()
+
     path = tmp_path / "data.zarr"
-    sdata.write(path)
+    sdata.write(path, convert_table_strings_to_categoricals=convert_strings_to_categoricals)
+
+    if convert_strings_to_categoricals:
+        expected_dtypes = dtypes_before_writing
+        expected_dtypes["column_only_region1"] = "category"
+        assert_series_equal(sdata["table"].obs.dtypes, expected_dtypes)
+    else:
+        assert_series_equal(sdata["table"].obs.dtypes, dtypes_before_writing)
 
     sdata2 = SpatialData.read(path)
     assert "column_only_region1" in sdata2["table"].obs.columns
@@ -1229,8 +1359,12 @@ def test_sdata_with_nan_in_obs(tmp_path: Path) -> None:
 
     assert r1.iloc[0] == "string"
     assert r2.iloc[1] == 3
-    if Version(pd.__version__) >= Version("3"):
-        assert pd.isna(r1.iloc[1])
-    else:  # After round-trip, NaN in object-dtype column becomes string "nan" on pandas 2
-        assert r1.iloc[1] == "nan"
     assert np.isnan(r2.iloc[0])
+
+    if Version(version("pandas")) >= Version("3"):
+        assert pd.isna(r1.iloc[1])
+    else:  # After round-trip, NaN in object-dtype column becomes string
+        if convert_strings_to_categoricals:
+            assert pd.isna(r1.iloc[1])
+        else:
+            assert r1.iloc[1] == "nan"

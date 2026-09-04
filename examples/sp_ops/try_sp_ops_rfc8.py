@@ -7,6 +7,8 @@ Run from the repo root with its dev venv, on branch vibecoded-experiment/sp-ops-
     cd /Users/macbook/embl/projects/basel/spatialdata_luca
     .venv/bin/python examples/sp_ops/try_sp_ops_rfc8.py
 
+Its captured output lives alongside it in try_sp_ops_rfc8_output.txt.
+
 Requires the two example sp-ops-conformant stores built for the compliance review that
 motivated this stack, at OPS_DIR below -- not shipped with this repo.
 
@@ -28,14 +30,13 @@ OPS_DIR = Path("/Users/macbook/ssd/biodata/ops/spops_conformant")
 
 def main() -> None:
     # --- RFC-8 reader: two real conformant stores ---
+    # --- repr: nested, truncated tree instead of a flat dump of all elements ---
     p001 = sd.read_zarr(OPS_DIR / "P001_spops.zarr")
     print(f"P001_spops.zarr (raw):        {len(p001._elements)} elements")
+    print(p001)
 
     biohub = sd.read_zarr(OPS_DIR / "Biohub_OPS0001_spops.zarr")
     print(f"Biohub_OPS0001_spops.zarr:    {len(biohub._elements)} elements")
-
-    # --- repr: nested, truncated tree instead of a flat dump of all elements ---
-    print("\nBiohub_OPS0001_spops.zarr repr:")
     print(biohub)
 
     # --- relationships: sp-ops:relationships resolved from the Biohub store ---

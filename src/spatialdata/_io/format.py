@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import ome_zarr.format
@@ -15,6 +15,7 @@ from ome_zarr.format import (
 )
 from shapely import GeometryType
 
+from spatialdata._core.links.edges import LINK_ATTRS_KEY, validate_link_spec
 from spatialdata.models.models import ATTRS_KEY, PointsModel, ShapesModel
 
 CoordinateTransform_t = list[dict[str, Any]]
@@ -140,6 +141,9 @@ class SpatialDataContainerFormatV01(FormatV04):
 
         return {"spatialdata_software_version": __version__}
 
+    def validate_attrs(self, attrs: Mapping[str, Any]) -> None:
+        """Validate the SpatialData-level attrs before they are written; this version reserves no key."""
+
 
 class SpatialDataContainerFormatV02(FormatV05):
     @property
@@ -153,6 +157,36 @@ class SpatialDataContainerFormatV02(FormatV05):
         from spatialdata import __version__
 
         return {"spatialdata_software_version": __version__}
+
+    def validate_attrs(self, attrs: Mapping[str, Any]) -> None:
+        """Validate the SpatialData-level attrs before they are written; this version reserves no key."""
+
+
+class SpatialDataContainerFormatV03(FormatV05):
+    """Container format reserving ``attrs["spatialdata_link"]`` for the links between elements."""
+
+    @property
+    def spatialdata_format_version(self) -> str:
+        return "0.3"
+
+    def attrs_from_dict(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    def attrs_to_dict(self) -> dict[str, str | dict[str, Any]]:
+        from spatialdata import __version__
+
+        return {"spatialdata_software_version": __version__}
+
+    def validate_attrs(self, attrs: Mapping[str, Any]) -> None:
+        """Validate the SpatialData-level attrs before they are written.
+
+        Raises
+        ------
+        ValueError
+            If ``attrs["spatialdata_link"]`` is present and is not a valid list of edges.
+        """
+        if LINK_ATTRS_KEY in attrs:
+            validate_link_spec(attrs[LINK_ATTRS_KEY])
 
 
 class RasterFormatV01(FormatV04, CoordinateMixinV01):
@@ -284,13 +318,15 @@ CurrentRasterFormat = RasterFormatV03
 CurrentShapesFormat = ShapesFormatV03
 CurrentPointsFormat = PointsFormatV02
 CurrentTablesFormat = TablesFormatV02
-CurrentSpatialDataContainerFormat = SpatialDataContainerFormatV02
+CurrentSpatialDataContainerFormat = SpatialDataContainerFormatV03
 
 RasterFormatType = RasterFormatV01 | RasterFormatV02 | RasterFormatV03
 ShapesFormatType = ShapesFormatV01 | ShapesFormatV02 | ShapesFormatV03
 PointsFormatType = PointsFormatV01 | PointsFormatV02
 TablesFormatType = TablesFormatV01 | TablesFormatV02
-SpatialDataContainerFormatType = SpatialDataContainerFormatV01 | SpatialDataContainerFormatV02
+SpatialDataContainerFormatType = (
+    SpatialDataContainerFormatV01 | SpatialDataContainerFormatV02 | SpatialDataContainerFormatV03
+)
 SpatialDataFormatType = (
     RasterFormatType | ShapesFormatType | PointsFormatType | TablesFormatType | SpatialDataContainerFormatType
 )
@@ -327,6 +363,7 @@ TablesFormats: dict[str, TablesFormatType] = {
 SpatialDataContainerFormats: dict[str, SpatialDataContainerFormatType] = {
     "0.1": SpatialDataContainerFormatV01(),
     "0.2": SpatialDataContainerFormatV02(),
+    "0.3": SpatialDataContainerFormatV03(),
 }
 ContainerFormatValidElements = {
     SpatialDataContainerFormatV01().__str__(): [
@@ -338,6 +375,12 @@ ContainerFormatValidElements = {
         TablesFormatV01().__str__(),
     ],
     SpatialDataContainerFormatV02().__str__(): [
+        RasterFormatV03().__str__(),
+        ShapesFormatV03().__str__(),
+        PointsFormatV02().__str__(),
+        TablesFormatV02().__str__(),
+    ],
+    SpatialDataContainerFormatV03().__str__(): [
         RasterFormatV03().__str__(),
         ShapesFormatV03().__str__(),
         PointsFormatV02().__str__(),

@@ -16,6 +16,7 @@ from pyarrow import ArrowInvalid
 from upath import UPath
 from zarr.errors import ArrayNotFoundError
 
+from spatialdata._core.links.edges import LINK_ATTRS_KEY, validate_link_spec
 from spatialdata._core.spatialdata import SpatialData
 from spatialdata._io._utils import (
     BadFileHandleMethod,
@@ -33,7 +34,7 @@ from spatialdata._types import Raster_T
 def _read_zarr_group_spatialdata_element(
     root_group: zarr.Group,
     root_store_path: str,
-    sdata_version: Literal["0.1", "0.2"],
+    sdata_version: Literal["0.1", "0.2", "0.3"],
     selector: set[str],
     read_func: Callable[..., Any],
     group_name: Literal["images", "labels", "shapes", "points", "tables"],
@@ -85,7 +86,7 @@ def _read_zarr_group_spatialdata_element(
 
 def get_raster_format_for_read(
     group: zarr.Group,
-    sdata_version: Literal["0.1", "0.2"],
+    sdata_version: Literal["0.1", "0.2", "0.3"],
     return_ome_zarr_format: bool = False,
 ) -> Format:
     """Get raster format of stored raster data.
@@ -113,7 +114,7 @@ def get_raster_format_for_read(
 
     if sdata_version == "0.1":
         group_version = group.metadata.attributes["multiscales"][0]["version"]
-    elif sdata_version == "0.2":
+    elif sdata_version in ("0.2", "0.3"):
         group_version = group.metadata.attributes["ome"]["version"]
     else:
         raise ValueError(f"Unknown SpatialData zarr version {sdata_version}")
@@ -160,7 +161,7 @@ def read_zarr(
     # the following is the SpatialDataContainerFormat version
     if "spatialdata_attrs" not in root_group.metadata.attributes:
         # backward compatibility for pre-versioned SpatialData zarr stores
-        sdata_version: Literal["0.1", "0.2"] = "0.1"
+        sdata_version: Literal["0.1", "0.2", "0.3"] = "0.1"
     else:
         sdata_version = root_group.metadata.attributes["spatialdata_attrs"]["version"]
     if sdata_version == "0.1":
@@ -222,6 +223,18 @@ def read_zarr(
         attrs.pop("spatialdata_attrs")
     else:
         attrs = None
+
+    # From container format 0.3 on, `attrs["spatialdata_link"]` is reserved for the links between elements. A malformed
+    # value must not make the store unreadable: it is kept as it is and reported.
+    if attrs is not None and sdata_version == "0.3" and LINK_ATTRS_KEY in attrs:
+        try:
+            validate_link_spec(attrs[LINK_ATTRS_KEY])
+        except ValueError as e:
+            warnings.warn(
+                f"The link specification stored in attrs[{LINK_ATTRS_KEY!r}] is invalid and was left untouched: {e}",
+                UserWarning,
+                stacklevel=2,
+            )
 
     sdata = SpatialData(
         images=images,

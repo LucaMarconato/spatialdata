@@ -31,14 +31,18 @@ from spatialdata._logging import logger
 from spatialdata._types import ArrayLike
 from spatialdata._utils import _check_match_length_channels_c_dim
 from spatialdata.config import settings
-from spatialdata.models import C, X, Y, Z, get_axes_names
 from spatialdata.models._utils import (
     DEFAULT_COORDINATE_SYSTEM,
     TRANSFORM_KEY,
+    C,
     MappingToCoordinateSystem_t,
     SpatialElement,
+    X,
+    Y,
+    Z,
     _validate_mapping_to_coordinate_system_type,
     convert_region_column_to_categorical,
+    get_axes_names,
 )
 from spatialdata.models.chunks_utils import Chunks_t
 from spatialdata.models.pyramids_utils import ScaleFactors_t  # ozp -> ome-zarr-py
@@ -953,6 +957,7 @@ class TableModel:
     REGION_KEY = "region"
     REGION_KEY_KEY = "region_key"
     INSTANCE_KEY = "instance_key"
+    VERSION_KEY = "version"
     ATTRS_KEY = ATTRS_KEY
 
     @classmethod
@@ -1135,6 +1140,31 @@ class TableModel:
                     )
 
     @classmethod
+    def has_region_annotation(cls, data: AnnData) -> bool:
+        """
+        Return whether the table carries ``region``/``region_key``/``instance_key`` metadata (table format up to 0.2).
+
+        From table format 0.3 on, the elements annotated by a table are described by the links of the SpatialData
+        object (``sdata.links``) and the table metadata only holds the format version.
+        """
+        attrs = data.uns.get(ATTRS_KEY)
+        return isinstance(attrs, Mapping) and any(
+            key in attrs for key in (cls.REGION_KEY, cls.REGION_KEY_KEY, cls.INSTANCE_KEY)
+        )
+
+    @classmethod
+    def _validate_metadata_v03(cls, attrs: Mapping[str, Any]) -> None:
+        unknown = sorted(set(attrs) - {cls.VERSION_KEY})
+        if unknown:
+            raise ValueError(
+                f"`adata.uns['{ATTRS_KEY}']` must contain either the `{cls.REGION_KEY}`, `{cls.REGION_KEY_KEY}` and "
+                f"`{cls.INSTANCE_KEY}` metadata (table format up to 0.2) or only `{cls.VERSION_KEY}` (table format "
+                f"0.3); found unexpected keys {unknown}."
+            )
+        if cls.VERSION_KEY in attrs and not isinstance(attrs[cls.VERSION_KEY], str):
+            raise ValueError(f"`adata.uns['{ATTRS_KEY}']['{cls.VERSION_KEY}']` must be a string.")
+
+    @classmethod
     def validate(
         cls,
         data: AnnData,
@@ -1156,6 +1186,9 @@ class TableModel:
 
         validate_table_attr_keys(data)
         if ATTRS_KEY not in data.uns:
+            return data
+        if not cls.has_region_annotation(data):
+            cls._validate_metadata_v03(data.uns[ATTRS_KEY])
             return data
 
         _, region_key, instance_key = get_table_keys(data)
@@ -1220,6 +1253,10 @@ class TableModel:
         if n_args == 0:
             if cls.ATTRS_KEY not in adata.uns:
                 # table not annotating any element
+                return adata
+            if not cls.has_region_annotation(adata):
+                # table format 0.3: the links live in the SpatialData object, the metadata only holds the version
+                cls.validate(adata)
                 return adata
             attr = adata.uns[cls.ATTRS_KEY]
             region = attr[cls.REGION_KEY]
@@ -1363,12 +1400,17 @@ def get_table_keys(table: AnnData) -> tuple[str | list[str], str, str]:
     -------
     The keys in table.uns['spatialdata_attrs']
     """
-    if table.uns.get(TableModel.ATTRS_KEY):
+    if TableModel.has_region_annotation(table):
         attrs = table.uns[TableModel.ATTRS_KEY]
         return (
             attrs[TableModel.REGION_KEY],
             attrs[TableModel.REGION_KEY_KEY],
             attrs[TableModel.INSTANCE_KEY],
+        )
+    if table.uns.get(TableModel.ATTRS_KEY):
+        raise ValueError(
+            "The table uses table format 0.3: the elements it annotates are described by the links of the SpatialData "
+            "object (`sdata.links`), not by `region`, `region_key` and `instance_key` metadata."
         )
 
     raise ValueError(

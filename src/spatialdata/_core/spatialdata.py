@@ -192,7 +192,7 @@ class SpatialData:
             The dtypes of the instance key column in the table and the annotation target do not match.
         """
         TableModel.validate(table)
-        if TableModel.ATTRS_KEY in table.uns:
+        if TableModel.has_region_annotation(table):
             region, _, instance_key = get_table_keys(table)
             region = region if isinstance(region, list) else [region]
             for r in region:
@@ -487,8 +487,13 @@ class SpatialData:
         ):
             raise ValueError(f"Annotation target '{region}' not present as SpatialElement in SpatialData object.")
 
-        if table.uns.get(TableModel.ATTRS_KEY):
+        if TableModel.has_region_annotation(table):
             self._change_table_annotation_target(table, region, region_key, instance_key)
+        elif table.uns.get(TableModel.ATTRS_KEY):
+            raise ValueError(
+                f"The table {table_name!r} uses table format 0.3: describe the elements it annotates with "
+                "`sdata.links.add()`."
+            )
         elif isinstance(region_key, str) and isinstance(instance_key, str):
             self._set_table_annotation_target(table, region, region_key, instance_key)
         else:

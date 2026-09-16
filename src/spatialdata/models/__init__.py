@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from spatialdata._core.validation import check_target_region_column_symmetry
+from spatialdata.models._table_conversion import convert_table_v02_to_v03, convert_table_v03_to_v02
 from spatialdata.models._utils import (
     C,
     SpatialElement,
@@ -51,6 +52,8 @@ __all__ = [
     "points_geopandas_to_dask_dataframe",
     "points_dask_dataframe_to_geopandas",
     "check_target_region_column_symmetry",
+    "convert_table_v02_to_v03",
+    "convert_table_v03_to_v02",
     "get_table_keys",
     "validate_element",
     "get_channel_names",

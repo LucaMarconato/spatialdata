@@ -52,7 +52,7 @@ def get_element_annotators(sdata: SpatialData, element_name: str) -> set[str]:
     """
     table_names = set()
     for name, table in sdata.tables.items():
-        if table.uns.get(TableModel.ATTRS_KEY):
+        if TableModel.has_region_annotation(table):
             regions, _, _ = get_table_keys(table)
             if element_name in regions:
                 table_names.add(name)

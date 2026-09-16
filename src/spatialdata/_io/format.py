@@ -314,6 +314,19 @@ class TablesFormatV02(FormatV05):
         return "0.2"
 
 
+class TablesFormatV03(FormatV05):
+    """Formatter for the table.
+
+    From this version on, a table does not carry ``region``/``region_key``/``instance_key`` metadata: which elements
+    it annotates is described by the links of the SpatialData object (``attrs["spatialdata_link"]``), and each
+    annotated element has its own column of instance ids in ``obs``. The table metadata only holds the version.
+    """
+
+    @property
+    def spatialdata_format_version(self) -> str:
+        return "0.3"
+
+
 CurrentRasterFormat = RasterFormatV03
 CurrentShapesFormat = ShapesFormatV03
 CurrentPointsFormat = PointsFormatV02
@@ -323,7 +336,7 @@ CurrentSpatialDataContainerFormat = SpatialDataContainerFormatV03
 RasterFormatType = RasterFormatV01 | RasterFormatV02 | RasterFormatV03
 ShapesFormatType = ShapesFormatV01 | ShapesFormatV02 | ShapesFormatV03
 PointsFormatType = PointsFormatV01 | PointsFormatV02
-TablesFormatType = TablesFormatV01 | TablesFormatV02
+TablesFormatType = TablesFormatV01 | TablesFormatV02 | TablesFormatV03
 SpatialDataContainerFormatType = (
     SpatialDataContainerFormatV01 | SpatialDataContainerFormatV02 | SpatialDataContainerFormatV03
 )
@@ -359,6 +372,7 @@ PointsFormats: dict[str, PointsFormatType] = {
 TablesFormats: dict[str, TablesFormatType] = {
     "0.1": TablesFormatV01(),
     "0.2": TablesFormatV02(),
+    "0.3": TablesFormatV03(),
 }
 SpatialDataContainerFormats: dict[str, SpatialDataContainerFormatType] = {
     "0.1": SpatialDataContainerFormatV01(),
@@ -385,6 +399,7 @@ ContainerFormatValidElements = {
         ShapesFormatV03().__str__(),
         PointsFormatV02().__str__(),
         TablesFormatV02().__str__(),
+        TablesFormatV03().__str__(),
     ],
 }
 ContainerV01DefaultTypes: dict[str, SpatialDataFormatType] = {

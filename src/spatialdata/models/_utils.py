@@ -371,7 +371,7 @@ def get_raster_model_from_data_dims(dims: tuple[str, ...]) -> type[RasterSchema]
 def convert_region_column_to_categorical(table: AnnData) -> None:
     from spatialdata.models.models import TableModel
 
-    if TableModel.ATTRS_KEY in table.uns:
+    if TableModel.has_region_annotation(table):
         region_key = table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY_KEY]
         if not isinstance(table.obs[region_key].dtype, pd.CategoricalDtype):
             warnings.warn(

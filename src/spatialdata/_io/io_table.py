@@ -19,6 +19,7 @@ from spatialdata._io.format import (
     TablesFormats,
     TablesFormatV01,
     TablesFormatV02,
+    TablesFormatV03,
     _parse_version,
 )
 from spatialdata.models import TableModel, get_table_keys
@@ -47,6 +48,12 @@ def _read_table(store: str | Path) -> AnnData:
             # fix type for region
             if "region" in attrs and isinstance(attrs["region"], np.ndarray):
                 attrs["region"] = attrs["region"].tolist()
+    elif isinstance(table_format, TablesFormatV03):
+        # the links to the annotated elements live in the SpatialData attrs; the table carries only its version
+        if TableModel.has_region_annotation(table):
+            raise ValueError(
+                "The table is stored with table format 0.3 but carries `region`/`region_key`/`instance_key` metadata."
+            )
     else:
         raise ValueError(
             f"Unsupported table format: {type(table_format)}. Supported formats are: {TablesFormats.values()}"
@@ -86,17 +93,30 @@ def write_table(
             message=WritingToZarrV2DeprecationWarning.message, category=WritingToZarrV2DeprecationWarning, stacklevel=2
         )
 
-    if TableModel.ATTRS_KEY in table.uns:
+    if element_format not in TablesFormats.values():
+        raise FormatVersionUnknownError(element_type="table", version_encountered=element_format)
+
+    writes_v03 = isinstance(element_format, TablesFormatV03)
+    if TableModel.has_region_annotation(table):
+        if writes_v03:
+            raise ValueError(
+                "Table format 0.3 does not store `region`/`region_key`/`instance_key` metadata. Convert the table with "
+                "`spatialdata.models.convert_table_v02_to_v03()` or write it with `TablesFormatV02()`."
+            )
         region, region_key, instance_key = get_table_keys(table)
         TableModel.validate(table)
     else:
+        if TableModel.ATTRS_KEY in table.uns:
+            TableModel.validate(table)
+            if not writes_v03:
+                raise ValueError(
+                    "The table uses table format 0.3 (its links live in the SpatialData object); it can only be "
+                    "written with `TablesFormatV03()`."
+                )
         region, region_key, instance_key = (None, None, None)
 
     # Ensure the table group exists
     table_group = group.require_group(name=name)
-
-    if element_format not in TablesFormats.values():
-        raise FormatVersionUnknownError(element_type="table", version_encountered=element_format)
 
     if element_format.zarr_format == 3 and Version(version("anndata")) >= Version("0.13"):
         # `write_zarr` in anndata v0.13 and above can only write to zarr v3
@@ -126,7 +146,8 @@ def write_table(
     table_group = group[name]
 
     table_group.attrs["spatialdata-encoding-type"] = group_type
-    table_group.attrs["region"] = region
-    table_group.attrs["region_key"] = region_key
-    table_group.attrs["instance_key"] = instance_key
+    if not writes_v03:
+        table_group.attrs["region"] = region
+        table_group.attrs["region_key"] = region_key
+        table_group.attrs["instance_key"] = instance_key
     table_group.attrs["version"] = element_format.spatialdata_format_version

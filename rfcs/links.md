@@ -1,5 +1,15 @@
 # RFC: instance-level linking for SpatialData (mulink-compatible)
 
+## Authors and acknowledgements
+
+_Draft._ The list of authors will be completed before the RFC is formally
+presented for review. Both the authors and the acknowledgements will include
+the people who worked on element relationships during the hackathons where
+this design took shape — the scverse proteomics hackathon (Berlin, 2026), the
+scverse hackathon in Padua (2026) and the Bioconductor hackathon in Venice
+(2026) — as well as the participants in the MuData feature-mapping discussion
+(see References).
+
 ## Summary
 
 `SpatialData` should be able to answer relationship queries between the

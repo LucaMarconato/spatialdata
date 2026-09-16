@@ -22,6 +22,7 @@ from xarray import DataArray, DataTree
 from zarr.errors import GroupNotFoundError
 
 from spatialdata._core._elements import Images, Labels, Points, Shapes, Tables
+from spatialdata._core.links import Links
 from spatialdata._core.validation import (
     check_all_keys_case_insensitively_unique,
     check_target_region_column_symmetry,
@@ -217,6 +218,24 @@ class SpatialData:
                             f"({table.obs[instance_key].dtype}) that does not match the dtype of the indices of "
                             f"the annotated element ({dtype})."
                         )
+
+    def validate(self) -> None:
+        """
+        Validate the object: element names, the metadata of the tables and the links between elements.
+
+        The links are validated in the same way when the object is written to disk (from container format 0.3 on)
+        and when an edge is added through :attr:`links`.
+
+        Raises
+        ------
+        ValueError
+            If an element has an invalid name, a table has invalid metadata keys, or ``attrs["spatialdata_link"]`` is
+            malformed or references elements that are not in the object.
+        """
+        self._validate_all_elements()
+        for table in self.tables.values():
+            self.validate_table_in_spatialdata(table)
+        self.links.validate()
 
     @staticmethod
     def get_annotated_regions(table: AnnData) -> list[str]:
@@ -1181,6 +1200,8 @@ class SpatialData:
             file_path = Path(file_path)
         self._validate_can_safely_write_to_path(file_path, overwrite=overwrite)
         self._validate_all_elements()
+        # fail before creating the store: `write_attrs()` validates again, but by then the group would already exist
+        parsed["SpatialData"].validate_attrs(self.attrs)
 
         store = _resolve_zarr_store(file_path)
         zarr_format = parsed["SpatialData"].zarr_format
@@ -1692,6 +1713,7 @@ class SpatialData:
 
         sdata_format = sdata_format if sdata_format is not None else CurrentSpatialDataContainerFormat()
         assert isinstance(sdata_format, SpatialDataContainerFormatType)
+        sdata_format.validate_attrs(self.attrs)
 
         store = None
 
@@ -2439,6 +2461,16 @@ class SpatialData:
             self._attrs = value
         else:
             self._attrs = dict(value)
+
+    @property
+    def links(self) -> Links:
+        """
+        Links between the elements of this object.
+
+        The edges are stored in ``attrs["spatialdata_link"]`` and persisted with the other attrs; this property
+        returns a view over them (see :class:`spatialdata._core.links.Links`).
+        """
+        return Links(self)
 
     def filter_by_table_query(
         self,

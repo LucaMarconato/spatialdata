@@ -22,6 +22,7 @@ from spatialdata._io.format import (
     ShapesFormatV03,
     SpatialDataContainerFormatV01,
     SpatialDataContainerFormatV02,
+    SpatialDataContainerFormatV03,
     SpatialDataFormatType,
     TablesFormatV01,
     TablesFormatV02,
@@ -236,6 +237,21 @@ class TestFormatConversions:
             assert_spatial_data_objects_are_identical(full_sdata, sdata_read_v2)
             assert sdata_read_v2.is_self_contained()
             assert sdata_read_v2.has_consolidated_metadata()
+
+    def test_container_v2_to_v3(self, full_sdata):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f2 = Path(tmpdir) / "data2.zarr"
+            f3 = Path(tmpdir) / "data3.zarr"
+
+            full_sdata.write(f2, sdata_formats=[SpatialDataContainerFormatV02()])
+            sdata_read_v2 = read_zarr(f2)
+            assert_spatial_data_objects_are_identical(full_sdata, sdata_read_v2)
+
+            sdata_read_v2.write(f3, sdata_formats=[SpatialDataContainerFormatV03()])
+            sdata_read_v3 = read_zarr(f3)
+            assert_spatial_data_objects_are_identical(full_sdata, sdata_read_v3)
+            assert sdata_read_v3.is_self_contained()
+            assert sdata_read_v3.has_consolidated_metadata()
 
     def test_channel_names_raster_images_v1_to_v2_to_v3(self, images):
         images = images.subset(["image2d", "image2d_multiscale"])

@@ -325,26 +325,64 @@ its adapter, filters tables annotating kept elements with
 `SpatialData(..., attrs=deepcopy(sdata.attrs))`. It never depends on mudata or
 mulink. `SpatialData.subset()` (by element names) is unchanged.
 
+## Status
+
+Implemented so far, as stacked pull requests on the fork (each one based on
+the previous, the first one on `rfc-link`, which carries this document):
+
+| PR                                                          | Branch                           | What landed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ----------------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [#10](https://github.com/LucaMarconato/spatialdata/pull/10) | `links/01-schema-container-v03`  | The **edge description** (`Edge`, `validate_link_spec`) and the **`sdata.links` view** over `attrs["spatialdata_link"]` (`add`, `remove`, `for_element`, `validate`, `to_dicts`, `repr`), `sdata.validate()`, and **container format 0.3**, which reserves the key: validated on write, tolerated with a warning when a stored value is malformed; 0.2 stores treat the key as plain attrs.                                                                                                                                                                                                                                                                                    |
+| [#11](https://github.com/LucaMarconato/spatialdata/pull/11) | `links/02-table-format-v03`      | **Table format 0.3** (`TablesFormatV03`): the table metadata holds only the version, one column of instance ids per annotated element. The two **converters** (`convert_table_v02_to_v03` returning the table and its edges, `convert_table_v03_to_v02` the inverse), reading and writing of 0.3 tables, and `TableModel.has_region_annotation()` so every reader of the legacy triple keeps working and fails clearly on 0.3 tables.                                                                                                                                                                                                                                          |
+| [#12](https://github.com/LucaMarconato/spatialdata/pull/12) | `links/03-table-links-migration` | The **compatibility layer** `_core/links/tables.py` (`resolve_instance_ids`, `annotated_elements`, `table_instance_keys[_any_format]`, `get_table_links`, `right_key_for_element`, `convert_legacy_table`) and the migration of every consumer of the legacy triple to it: the five joins and `join_spatialelement_table` (which gains `instance_keys=`), `match_sdata_to_table`, `get_element_annotators`, `get_values`, `_filter_table_by_elements`, `filter_by_coordinate_system`, `concatenate` (links carried over, suffixes applied), `rasterize_bins`, the tiles dataloader. `SpatialData.annotated_elements()` and a links-aware `set_table_annotates_spatialelement`. |
+
+Everything above is backwards compatible: `CurrentTablesFormat` is still 0.2,
+a table keeps its `region`/`region_key`/`instance_key` metadata unless
+`convert_table_v02_to_v03` (or `convert_legacy_table`) is called on it, and
+the existing test suite passes unchanged.
+
+### Next
+
+1. **Flip the default to table format 0.3** (`links/04-table-format-default`).
+   `CurrentTablesFormat = TablesFormatV03`; convert legacy tables
+   automatically on `read_zarr` and when a table is added to a `SpatialData`
+   object (the hook is a one-line `on_set` on `Tables`, prototyped and then
+   reverted in PR 3); `TableModel.parse(region=…, region_key=…,
+instance_key=…)` keeps working with a `DeprecationWarning`. This is the
+   first **user-visible** change of the series — `obs["region"]` and
+   `obs["instance_id"]` are replaced by one column per annotated element — so
+   it also carries the migration of the fixtures and of the ~186 assertions
+   on the legacy columns across 13 test files (`tests/conftest.py`,
+   `tests/core/query/*`, `tests/core/operations/*`, `tests/io/test_multi_table.py`,
+   `tests/models/test_models.py`, …). Keep the exclusive-join and
+   `match_rows` semantics under test while doing it.
+2. `links/05-protocol-adapters` — `InstanceCollection`, the per-element
+   adapters and `ElementAdapter` (instance ↔ element links).
+3. `links/06-native-backend` — the element graph and the native traversal.
+4. `links/07-accessor-subset-by` — the rest of `sdata.links` (`add_group`,
+   `check`, `graph`/`to_mermaid`, `index_element`), `subset_by`, and the
+   deep copy of `attrs` on subsetting.
+5. `links/08-spatial-join` — suggested edges, `sjoin`/pixel lookup,
+   `materialize`.
+6. `links/09-mulink-backend` — `to_mudata()` and the mulink backend
+   (tables-only until mudata accepts non-AnnData modalities).
+7. `links/10-duckdb-backend`.
+
+Known gaps to close along the way: `SpatialData.subset()`/`query()` still
+pass `attrs` by reference (the links are therefore shared with the subset);
+`get_annotated_regions` raises on 0.3 tables and callers should move to
+`sdata.annotated_elements()`; `concatenate` refuses to mix the two formats
+in one table.
+
 ## Development workflow
 
 Personal forks, stacked pull requests against each fork's `main`; nothing is
-opened upstream.
+opened upstream. PR 1 targets `rfc-link`; each following PR targets the
+previous branch. The `Edge` dataclass in `_core/relationships.py` of
+[LucaMarconato/spatialdata#3](https://github.com/LucaMarconato/spatialdata/pull/3)
+(branch `vibecoded-experiment/sp-ops-relationships`) is the reference shape;
+the `vibecoded-experiment/*` stack itself is not a base.
 
-- spatialdata (`https://github.com/LucaMarconato/spatialdata`), after syncing
-  the fork's `main` with `scverse/spatialdata`:
-    1. `links/01-schema-container-v03` — `Edge`/`Links` view over `attrs["spatialdata_link"]`, container format V03, `validate_attrs`, `sdata.validate()`
-    2. `links/02-table-format-v03` — `TablesFormatV03` (version-only metadata), converters returning edges, `TableModel.parse` deprecation path, read-time conversion, join code reading edges from `sdata.links`
-    3. `links/03-protocol-adapters` — `InstanceCollection`, element adapters, `ElementAdapter` (instance ↔ element links)
-    4. `links/04-native-backend` — element graph, native traversal
-    5. `links/05-accessor-subset-by` — `sdata.links` methods, `check`, `graph`/export, `subset_by`, attrs deep copy
-    6. `links/06-spatial-join` — suggested edges, `sjoin`/pixel lookup, `materialize`
-    7. `links/07-mulink-backend` — `to_mudata()`, mulink backend (tables-only until item 9)
-    8. `links/08-duckdb-backend`
-       PR 1 targets `main`; each following PR targets the previous branch. The
-       `Edge` dataclass in `_core/relationships.py` of
-       [LucaMarconato/spatialdata#3](https://github.com/LucaMarconato/spatialdata/pull/3)
-       (branch `vibecoded-experiment/sp-ops-relationships`) is the reference
-       shape; the `vibecoded-experiment/*` stack itself is not a base.
 - mulink (`https://github.com/LucaMarconato/mulink`): `obs-axis/01-query-axis`
   (`QueryAccessor(axis=...)` over `obs_names/obsp/obsmap`),
   `obs-axis/02-batched-reachability` (one BFS from a virtual source instead of

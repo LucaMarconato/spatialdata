@@ -54,17 +54,45 @@ class TestTableFormatV03IO:
                 sdata.write(Path(tmpdir) / "data.zarr", sdata_formats=[TablesFormatV02()])
 
     def test_legacy_table_cannot_be_written_as_v03(self) -> None:
+        # a table outside a SpatialData object keeps its legacy metadata: it must be converted before being written
+        from spatialdata._io.io_table import write_table
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            sdata = SpatialData(tables={"table": _table_v02()})
+            group = zarr.open_group(Path(tmpdir) / "data.zarr", mode="w")
             with pytest.raises(ValueError, match="Convert the table with"):
-                sdata.write(Path(tmpdir) / "data.zarr", sdata_formats=[TablesFormatV03()])
+                write_table(_table_v02(), group, "table", element_format=TablesFormatV03())
 
     def test_default_format_still_writes_legacy_tables(self) -> None:
+        # the conversion to format 0.3 is explicit: adding a legacy table to a SpatialData object does not convert it
         with tempfile.TemporaryDirectory() as tmpdir:
             f = Path(tmpdir) / "data.zarr"
             sdata = SpatialData(tables={"table": _table_v02()})
+            assert sdata["table"].uns["spatialdata_attrs"]["region"] == "cells"
+            assert len(sdata.links) == 0
+
             sdata.write(f)
             group = zarr.open_group(f, mode="r")["tables/table"]
             assert group.attrs["version"] == "0.2"
             assert group.attrs["region"] == "cells"
             assert read_zarr(f)["table"].uns["spatialdata_attrs"]["region_key"] == "region"
+
+    def test_convert_legacy_table_registers_the_links(self) -> None:
+        from spatialdata._core.links.tables import convert_legacy_table
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f = Path(tmpdir) / "data.zarr"
+            sdata = SpatialData(tables={"table": _table_v02()})
+            sdata["table"] = convert_legacy_table(sdata, "table", sdata["table"])
+
+            assert sdata["table"].uns["spatialdata_attrs"] == {"version": "0.3"}
+            assert sdata["table"].obs["cells"].tolist() == [1, 2, 3]
+            assert [(e.from_, e.to) for e in sdata.links] == [("table", "cells")]
+
+            sdata.write(f, sdata_formats=[TablesFormatV03()])
+            group = zarr.open_group(f, mode="r")["tables/table"]
+            assert group.attrs["version"] == "0.3"
+            assert "region" not in group.attrs
+
+            read = read_zarr(f)
+            assert read["table"].uns["spatialdata_attrs"] == {"version": "0.3"}
+            assert [(e.from_, e.to) for e in read.links] == [("table", "cells")]

@@ -221,11 +221,17 @@ def _get_filtered_or_unfiltered_tables(
 
     """
     if filter_table:
+        from spatialdata._core.links.tables import table_instance_keys_any_format
         from spatialdata._core.query.relational_query import _filter_table_by_elements
 
         return {
             name: filtered_table
             for name, table in sdata.tables.items()
-            if (filtered_table := _filter_table_by_elements(table, elements)) is not None
+            if (
+                filtered_table := _filter_table_by_elements(
+                    table, elements, table_instance_keys_any_format(table, sdata=sdata, table_name=name)
+                )
+            )
+            is not None
         }
     return sdata.tables

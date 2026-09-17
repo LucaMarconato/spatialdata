@@ -8,10 +8,13 @@ from typing import Any
 from warnings import warn
 
 import numpy as np
+import pandas as pd
 from anndata import AnnData
 from anndata._core.merge import StrategiesLiteral, resolve_merge_strategy
 
 from spatialdata._core._utils import _find_common_table_keys
+from spatialdata._core.links.edges import LINK_ATTRS_KEY, Edge
+from spatialdata._core.links.tables import get_table_links
 from spatialdata._core.spatialdata import SpatialData
 from spatialdata.models import TableModel, get_table_keys
 from spatialdata.transformations import (
@@ -33,8 +36,21 @@ def _concatenate_tables(
 ) -> AnnData:
     import anndata as ad
 
-    if not all(TableModel.has_region_annotation(table) for table in tables):
-        raise ValueError("Not all tables are annotating a spatial element")
+    legacy = [TableModel.has_region_annotation(table) for table in tables]
+    if not any(legacy):
+        # table format 0.3: one column of instance ids per annotated element; `anndata.concat` aligns `obs` columns
+        # with `join` (inner by default), so the columns present in only some tables are re-attached, `NA` elsewhere
+        merged_table = ad.concat(tables, **kwargs)
+        all_obs = pd.concat([table.obs for table in tables], join="outer", ignore_index=True)
+        for column in all_obs.columns.difference(merged_table.obs.columns):
+            merged_table.obs[column] = all_obs[column].to_numpy()
+        merged_table.uns[TableModel.ATTRS_KEY] = {TableModel.VERSION_KEY: "0.3"}
+        return TableModel.parse(merged_table)
+    if not all(legacy):
+        raise ValueError(
+            "Cannot concatenate tables in table format 0.3 with tables carrying `region`/`region_key`/`instance_key` "
+            "metadata."
+        )
     region_keys = [table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY_KEY] for table in tables]
     instance_keys = [table.uns[TableModel.ATTRS_KEY][TableModel.INSTANCE_KEY] for table in tables]
     regions = [table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY] for table in tables]
@@ -203,7 +219,15 @@ def concatenate(
                     merged_tables[k] = v
 
     attrs_merge = resolve_merge_strategy(attrs_merge)
-    attrs = attrs_merge([sdata.attrs for sdata in sdatas])
+    attrs = dict(attrs_merge([sdata.attrs for sdata in sdatas]) or {})
+    # the links of all the objects are kept, whatever the merge strategy of the other attrs
+    edges: list[dict[str, Any]] = []
+    for sdata in sdatas:
+        edges.extend(d for d in sdata.links.to_dicts() if d not in edges)
+    if edges:
+        attrs[LINK_ATTRS_KEY] = edges
+    else:
+        attrs.pop(LINK_ATTRS_KEY, None)
 
     sdata = SpatialData(
         images=merged_images,
@@ -217,6 +241,31 @@ def concatenate(
         for table in sdata.tables.values():
             table.obs_names_make_unique()
     return sdata
+
+
+def _suffixed_edge(
+    edge: Edge,
+    suffix: str,
+    table_names: set[str],
+    rename_tables: bool,
+    column_renames: dict[str, dict[str, str]],
+) -> Edge:
+    """Return the edge with the element names (and the renamed link columns) carrying the suffix."""
+
+    def renamed(element_name: str) -> str:
+        if element_name in table_names and not rename_tables:
+            return element_name
+        return f"{element_name}-{suffix}"
+
+    on = dict(edge.on)
+    if "left" in on:
+        on["left"] = column_renames.get(edge.from_, {}).get(on["left"], on["left"])
+    if "right" in on and isinstance(edge.to, str):
+        on["right"] = column_renames.get(edge.to, {}).get(on["right"], on["right"])
+    to: str | tuple[str, ...] = renamed(edge.to) if isinstance(edge.to, str) else tuple(renamed(t) for t in edge.to)
+    return Edge(
+        from_=renamed(edge.from_), to=to, method=edge.method, on=on, status=edge.status, cardinality=edge.cardinality
+    )
 
 
 def _fix_ensure_unique_element_names(
@@ -246,20 +295,28 @@ def _fix_ensure_unique_element_names(
 
         # Handle tables with suffix
         tables = {}
+        column_renames: dict[str, dict[str, str]] = {}
         for name, table in sdata.tables.items():
             if not modify_tables_inplace:
                 table = table.copy()
 
-            # fix the region_key column
-            region, region_key, _ = get_table_keys(table)
-            table.obs[region_key] = (table.obs[region_key].astype("str") + f"-{suffix}").astype("category")
-            new_region: str | list[str]
-            if isinstance(region, str):
-                new_region = f"{region}-{suffix}"
+            if TableModel.has_region_annotation(table):
+                # fix the region_key column
+                region, region_key, _ = get_table_keys(table)
+                table.obs[region_key] = (table.obs[region_key].astype("str") + f"-{suffix}").astype("category")
+                new_region: str | list[str]
+                if isinstance(region, str):
+                    new_region = f"{region}-{suffix}"
+                else:
+                    assert isinstance(region, list)
+                    new_region = [f"{r}-{suffix}" for r in region]
+                table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY] = new_region
             else:
-                assert isinstance(region, list)
-                new_region = [f"{r}-{suffix}" for r in region]
-            table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY] = new_region
+                # the link columns get the suffix too, so that they stay distinct when tables are concatenated
+                renames = {link.column: f"{link.column}-{suffix}" for link in get_table_links(sdata, name).values()}
+                if renames:
+                    table.obs = table.obs.rename(columns=renames)
+                    column_renames[name] = renames
 
             # fix the obs names
             if rename_obs_names:
@@ -269,7 +326,15 @@ def _fix_ensure_unique_element_names(
             new_name = f"{name}-{suffix}" if rename_tables else name
             tables[new_name] = table
 
+        edges = [
+            _suffixed_edge(edge, suffix, set(sdata.tables.keys()), rename_tables, column_renames).to_dict()
+            for edge in sdata.links
+        ]
+        attrs = {k: v for k, v in sdata.attrs.items() if k != LINK_ATTRS_KEY}
+        if edges:
+            attrs[LINK_ATTRS_KEY] = edges
+
         # Create new SpatialData object with suffixed elements and tables
-        sdata_fixed = SpatialData.init_from_elements(elements | tables)
+        sdata_fixed = SpatialData.init_from_elements(elements | tables, attrs=attrs)
         sdatas_fixed.append(sdata_fixed)
     return sdatas_fixed

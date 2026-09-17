@@ -12,10 +12,11 @@ from numpy.random import default_rng
 from shapely import MultiPolygon, Point, Polygon
 from xarray import DataArray
 
+from spatialdata._core.links.tables import annotated_elements, table_instance_keys_any_format
 from spatialdata._core.query.relational_query import get_values
 from spatialdata._logging import logger
 from spatialdata._types import ArrayLike
-from spatialdata.models import Image2DModel, Labels2DModel, get_table_keys
+from spatialdata.models import Image2DModel, Labels2DModel, TableModel, get_table_keys
 from spatialdata.models._utils import _get_uint_dtype
 from spatialdata.transformations import Affine, Sequence, get_transformation
 
@@ -92,18 +93,20 @@ def rasterize_bins(
             f"If bins is a DataArray, it should hold labels; found a image element instead, with 'c': {element.dims}."
         )
 
-    _, region_key, instance_key = get_table_keys(table)
-    if not table.obs[region_key].dtype == "category":
-        raise ValueError(f"Please convert `table.obs['{region_key}']` to a category series to improve performances")
-    unique_regions = table.obs[region_key].cat.categories
-    if len(unique_regions) > 1:
+    if TableModel.has_region_annotation(table):
+        _, region_key, _ = get_table_keys(table)
+        if table.obs[region_key].dtype != "category":
+            raise ValueError(f"Please convert `table.obs['{region_key}']` to a category series to improve performances")
+    annotated = annotated_elements(table, sdata=sdata, table_name=table_name, non_empty=True)
+    if len(annotated) > 1:
         raise ValueError(
-            f"Found multiple regions annotated by the table: {', '.join(list(unique_regions))}, "
+            f"Found multiple regions annotated by the table: {', '.join(sorted(annotated))}, "
             "currently only tables annotating a single region are supported. Please open a feature request if you are "
             "interested in the general case."
         )
-    if unique_regions[0] != bins:
+    if bins not in annotated:
         raise ValueError("The table should be associated with the specified bins.")
+    instance_key = table_instance_keys_any_format(table, sdata=sdata, table_name=table_name)[bins]
 
     if isinstance(element, DataArray) and return_region_as_labels:
         raise ValueError(
@@ -279,9 +282,21 @@ def rasterize_bins_link_table_to_labels(sdata: SpatialData, table_name: str, ras
     rasterized_labels_name
         The name of the rasterized labels in the spatial data object.
     """
-    _, region_key, instance_key = get_table_keys(sdata[table_name])
-    sdata[table_name].obs[region_key] = pd.Categorical([rasterized_labels_name] * sdata[table_name].n_obs)
+    table = sdata[table_name]
+    instance_keys = table_instance_keys_any_format(table, sdata=sdata, table_name=table_name)
+    if len(instance_keys) != 1:
+        raise ValueError(
+            f"The table {table_name!r} must annotate exactly one element (the bins), found {len(instance_keys)}."
+        )
+    instance_key = next(iter(instance_keys.values()))
     relabled_instance_key = _get_relabeled_column_name(instance_key)
+    region_key = None
+    if TableModel.has_region_annotation(table):
+        _, region_key, _ = get_table_keys(table)
+        table.obs[region_key] = pd.Categorical([rasterized_labels_name] * table.n_obs)
     sdata.set_table_annotates_spatialelement(
-        table_name=table_name, region=rasterized_labels_name, region_key=region_key, instance_key=relabled_instance_key
+        table_name=table_name,
+        region=rasterized_labels_name,
+        region_key=region_key,
+        instance_key=relabled_instance_key,
     )

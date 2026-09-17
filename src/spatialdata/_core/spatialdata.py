@@ -23,6 +23,11 @@ from zarr.errors import GroupNotFoundError
 
 from spatialdata._core._elements import Images, Labels, Points, Shapes, Tables
 from spatialdata._core.links import Links
+from spatialdata._core.links.tables import (
+    get_table_links,
+    right_key_for_element,
+    table_instance_keys_any_format,
+)
 from spatialdata._core.validation import (
     check_all_keys_case_insensitively_unique,
     check_target_region_column_symmetry,
@@ -171,6 +176,27 @@ class SpatialData:
                         self.validate_table_in_spatialdata(v)
                         self.tables[k] = v
 
+    def _check_instance_ids_dtype(self, element_name: str, table: AnnData, column: str) -> None:
+        element = self.get(element_name)
+        if element is None:
+            warnings.warn(
+                f"The table is annotating {element_name!r}, which is not present in the SpatialData object.",
+                UserWarning,
+                stacklevel=3,
+            )
+            return
+        if isinstance(element, DataArray):
+            dtype = element.dtype
+        elif isinstance(element, DataTree):
+            dtype = element.scale0.ds.dtypes["image"]
+        else:
+            dtype = element.index.dtype
+        if dtype != table.obs[column].dtype and (dtype is str or table.obs[column].dtype is str):
+            raise TypeError(
+                f"Table instance_key column ({column}) has a dtype ({table.obs[column].dtype}) that does not match "
+                f"the dtype of the indices of the annotated element ({dtype})."
+            )
+
     def validate_table_in_spatialdata(self, table: AnnData) -> None:
         """
         Validate the presence of the annotation target of a SpatialData table in the SpatialData object.
@@ -194,30 +220,32 @@ class SpatialData:
         TableModel.validate(table)
         if TableModel.has_region_annotation(table):
             region, _, instance_key = get_table_keys(table)
-            region = region if isinstance(region, list) else [region]
-            for r in region:
-                element = self.get(r)
-                if element is None:
-                    warnings.warn(
-                        f"The table is annotating {r!r}, which is not present in the SpatialData object.",
-                        UserWarning,
-                        stacklevel=2,
+            for r in region if isinstance(region, list) else [region]:
+                self._check_instance_ids_dtype(r, table, instance_key)
+            return
+        # a table in format 0.3: its links are known only once it is part of the object
+        table_names = [name for name, t in self.tables.items() if t is table]
+        if table_names:
+            for link in get_table_links(self, table_names[0]).values():
+                if link.column not in table.obs:
+                    raise ValueError(
+                        f"The table {table_names[0]!r} is linked to {link.element!r} through the column "
+                        f"{link.column!r}, which is not in `table.obs`."
                     )
-                else:
-                    if isinstance(element, DataArray):
-                        dtype = element.dtype
-                    elif isinstance(element, DataTree):
-                        dtype = element.scale0.ds.dtypes["image"]
-                    else:
-                        dtype = element.index.dtype
-                    if dtype != table.obs[instance_key].dtype and (
-                        dtype is str or table.obs[instance_key].dtype is str
-                    ):
-                        raise TypeError(
-                            f"Table instance_key column ({instance_key}) has a dtype "
-                            f"({table.obs[instance_key].dtype}) that does not match the dtype of the indices of "
-                            f"the annotated element ({dtype})."
-                        )
+                self._check_instance_ids_dtype(link.element, table, link.column)
+
+    def annotated_elements(self, table_name: str) -> list[str]:
+        """
+        Return the names of the elements annotated by a table, as stated by the links of the object.
+
+        Parameters
+        ----------
+        table_name
+            The name of the table.
+        """
+        if table_name not in self.tables:
+            raise KeyError(f"No table with name {table_name!r} in the SpatialData object.")
+        return list(get_table_links(self, table_name))
 
     def validate(self) -> None:
         """
@@ -233,9 +261,10 @@ class SpatialData:
             malformed or references elements that are not in the object.
         """
         self._validate_all_elements()
+        # the links are validated first: the validation of the tables reads them
+        self.links.validate()
         for table in self.tables.values():
             self.validate_table_in_spatialdata(table)
-        self.links.validate()
 
     @staticmethod
     def get_annotated_regions(table: AnnData) -> list[str]:
@@ -255,6 +284,11 @@ class SpatialData:
             _get_region_metadata_from_region_key_column,
         )
 
+        if not TableModel.has_region_annotation(table):
+            raise ValueError(
+                "The table is in table format 0.3: the elements it annotates are described by the links of the "
+                "SpatialData object. Use `sdata.annotated_elements(table_name)` instead."
+            )
         return _get_region_metadata_from_region_key_column(table)
 
     @staticmethod
@@ -478,6 +512,10 @@ class SpatialData:
         -----
         Before calling this function, you may need to replace the values of the `region_key` column, or add a new
         `region_key` column. For example, by calling: sdata["table"].obs["region"] = "my_new_instances".
+
+        For a table in table format 0.3 (one column of instance ids per annotated element, links described by
+        ``sdata.links``), the previous links of the table are replaced by one link per element in `region`;
+        `instance_key` then names the column of instance ids, which must exist for each of them.
         """
         table = self.tables[table_name]
         element_names = {element[1] for element in self._gen_elements()}
@@ -487,18 +525,44 @@ class SpatialData:
         ):
             raise ValueError(f"Annotation target '{region}' not present as SpatialElement in SpatialData object.")
 
-        if TableModel.has_region_annotation(table):
+        has_metadata = bool(table.uns.get(TableModel.ATTRS_KEY))
+        if has_metadata and not TableModel.has_region_annotation(table):
+            # table format 0.3: the annotated elements are described by the links of the object
+            self._set_links_annotates_spatialelement(table_name, table, region, instance_key)
+            return
+        if has_metadata:
             self._change_table_annotation_target(table, region, region_key, instance_key)
-        elif table.uns.get(TableModel.ATTRS_KEY):
-            raise ValueError(
-                f"The table {table_name!r} uses table format 0.3: describe the elements it annotates with "
-                "`sdata.links.add()`."
-            )
         elif isinstance(region_key, str) and isinstance(instance_key, str):
             self._set_table_annotation_target(table, region, region_key, instance_key)
         else:
             raise TypeError("No current annotation metadata found. Please specify both region_key and instance_key.")
         convert_region_column_to_categorical(table)
+
+    def _set_links_annotates_spatialelement(
+        self,
+        table_name: str,
+        table: AnnData,
+        region: str | pd.Series | list[str],
+        instance_key: str | None,
+    ) -> None:
+        """Replace the links of a table in table format 0.3 with one link per element in ``region``."""
+        regions: list[str] = [region] if isinstance(region, str) else list(region)
+        current = get_table_links(self, table_name)
+        columns = {
+            element: (instance_key or current[element].column if element in current else instance_key)
+            for element in regions
+        }
+        for element, column in columns.items():
+            if column is None:
+                raise TypeError(f"No current link to {element!r} found. Please specify `instance_key`.")
+            if column not in table.obs:
+                raise ValueError(f"Instance key column '{column}' not found in table.obs.")
+        for edge in self.links.for_element(table_name, direction="from"):
+            self.links.remove(edge)
+        for element in regions:
+            column = columns[element]
+            assert column is not None
+            self.links.add(table_name, element, on=(column, right_key_for_element(self, element)), cardinality="1:1")
 
     @property
     def query(self) -> QueryManager:
@@ -705,10 +769,11 @@ class SpatialData:
         if filter_tables:
             tables: dict[str, AnnData] | Tables = {}
             for table_name, table in self._tables.items():
-                if include_orphan_tables and not table.uns.get(TableModel.ATTRS_KEY):
+                is_orphan = not TableModel.has_region_annotation(table) and not get_table_links(self, table_name)
+                if include_orphan_tables and is_orphan:
                     tables[table_name] = table
                     continue
-                if not include_orphan_tables and not table.uns.get(TableModel.ATTRS_KEY):
+                if not include_orphan_tables and is_orphan:
                     continue
                 if table_name in names_tables_to_keep:
                     tables[table_name] = table
@@ -725,7 +790,11 @@ class SpatialData:
                             elements_dict[element_type] = {
                                 name: elements[name] for name in element_names if name in elements
                             }
-                    table = _filter_table_by_elements(table, elements_dict=elements_dict)
+                    table = _filter_table_by_elements(
+                        table,
+                        elements_dict=elements_dict,
+                        instance_keys=table_instance_keys_any_format(table, sdata=self, table_name=table_name),
+                    )
                     if table is not None and len(table) != 0:
                         tables[table_name] = table
                 elif by == "elements":
@@ -734,7 +803,11 @@ class SpatialData:
                     )
 
                     assert elements_dict is not None
-                    table = _filter_table_by_elements(table, elements_dict=elements_dict)
+                    table = _filter_table_by_elements(
+                        table,
+                        elements_dict=elements_dict,
+                        instance_keys=table_instance_keys_any_format(table, sdata=self, table_name=table_name),
+                    )
                     if table is not None and len(table) != 0:
                         tables[table_name] = table
         else:

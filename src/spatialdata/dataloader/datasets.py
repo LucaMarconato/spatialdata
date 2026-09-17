@@ -12,12 +12,13 @@ import numpy as np
 import pandas as pd
 from anndata import AnnData
 from geopandas import GeoDataFrame
-from pandas import CategoricalDtype
 from scipy.sparse import issparse
 from torch.utils.data import Dataset
 from xarray import DataArray, DataTree
 
 from spatialdata._core.centroids import get_centroids
+from spatialdata._core.links.edges import LINK_ATTRS_KEY
+from spatialdata._core.links.tables import resolve_instance_ids
 from spatialdata._core.operations.transform import transform
 from spatialdata._core.operations.vectorize import to_circles
 from spatialdata._core.query.relational_query import get_element_instances, join_spatialelement_table
@@ -31,7 +32,6 @@ from spatialdata.models import (
     TableModel,
     get_axes_names,
     get_model,
-    get_table_keys,
 )
 from spatialdata.transformations import BaseTransformation, get_transformation, set_transformation
 
@@ -199,18 +199,13 @@ class ImageTilesDataset(Dataset):
                 )
 
             if table_name is not None:
-                _, region_key, instance_key = get_table_keys(self.sdata.tables[table_name])
                 if get_model(region_elem) in [Labels2DModel, Labels3DModel]:
                     indices = get_element_instances(region_elem).tolist()
                 else:
                     indices = region_elem.index.tolist()
                 table = self.sdata.tables[table_name]
-                if not isinstance(self.sdata.tables[table_name].obs[region_key].dtype, CategoricalDtype):
-                    raise TypeError(
-                        f"The `regions_element` column `{region_key}` in the table must be a categorical dtype. "
-                        f"Please convert it."
-                    )
-                instance_column = table.obs[table.obs[region_key] == region_name][instance_key].tolist()
+                ids_by_element = resolve_instance_ids(table, sdata=self.sdata, table_name=table_name)
+                instance_column = ids_by_element[region_name].tolist() if region_name in ids_by_element else []
                 if not set(indices).issubset(instance_column):
                     raise RuntimeError(
                         "Some of the instances in the region element are not annotated by the table. Instances of the "
@@ -231,10 +226,9 @@ class ImageTilesDataset(Dataset):
         from spatialdata import bounding_box_query
 
         if table_name is not None:
-            _, region_key, _ = get_table_keys(self.sdata.tables[table_name])
-            filtered_table = self.sdata.tables[table_name][
-                self.sdata.tables[table_name].obs[region_key].isin(self.regions)
-            ]  # filtered table for the data loader
+            table = self.sdata.tables[table_name]
+            # for each region, the positions of the table rows annotating it
+            ids_by_element = resolve_instance_ids(table, sdata=self.sdata, table_name=table_name)
 
         index_df = []
         tile_coords_df = []
@@ -273,8 +267,17 @@ class ImageTilesDataset(Dataset):
             index_df.append(df)
 
             if table_name is not None:
-                table_subset = filtered_table[filtered_table.obs[region_key] == region_name]
-                circles_sdata = SpatialData.init_from_elements({region_name: circles, "table": table_subset.copy()})
+                positions = (
+                    ids_by_element[region_name].index.to_numpy()
+                    if region_name in ids_by_element
+                    else np.zeros(0, dtype=int)
+                )
+                table_subset = table[positions]
+                links = [e.to_dict() for e in self.sdata.links.for_element(table_name, "from")]
+                circles_sdata = SpatialData.init_from_elements(
+                    {region_name: circles, "table": table_subset.copy()},
+                    attrs={LINK_ATTRS_KEY: links} if links else None,
+                )
                 _, table = join_spatialelement_table(
                     sdata=circles_sdata,
                     spatial_element_names=region_name,

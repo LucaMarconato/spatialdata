@@ -238,7 +238,11 @@ if not (OUT / "points" / "cell_centroids").exists():
 index = ShapesSpatialIndex(OUT / "shapes" / "cell_boundaries", OUT / "tables" / "table")
 print(index.metadata.levels[0], "margin", index.margin)
 """),
-    md("The grid is the one of the transcripts, so one tile request can load both:"),
+    md("""
+The grid is the one of the transcripts, so one tile request can load both. Note the margin: the largest overhang of
+a cell outside its tile is about 30 um, 4-5 tiles of 6.7 um, so every box query is grown by that much (RFC 4 takes
+the maximum over all the shapes; one large cell sets it for all).
+"""),
     code("""
 pts = PointsSpatialIndex(OUT / "points" / "transcripts_parquet")
 print(pts.metadata.levels[0].tile_size, index.metadata.levels[0].tile_size)
@@ -248,10 +252,10 @@ print(pts.metadata.levels[0].tile_size, index.metadata.levels[0].tile_size)
 lv0 = index.metadata.levels[0]
 center = np.array(lv0.origin) + np.array(lv0.tile_size) * np.array(lv0.grid_shape) / 2
 lo, hi = center - 150, center + 150
+gene = "C7"  # a gene expressed in kidney stroma
 t0 = time.time()
 cells = index.query(lo, hi)
 t1 = time.time()
-gene = index.var_names[int(np.argmax(np.asarray(sd.read_zarr(OUT)["table"].X[:2000].sum(axis=0)).ravel()))]
 values = index.gene_values(gene, cells["__row__"].to_numpy())
 t2 = time.time()
 print(f"{len(cells)} cells in {t1 - t0:.2f} s, {gene} in {t2 - t1:.2f} s")

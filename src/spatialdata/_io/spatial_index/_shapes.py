@@ -157,16 +157,19 @@ def write_shapes_with_spatial_index(
     return md, order
 
 
-def reorder_table_to_shapes(table: AnnData, shapes_index: pd.Index, add_csc: bool = True) -> AnnData:
-    """The rows of ``table`` annotating ``shapes_index`` (one row per shape, in the order of the shapes).
+def reorder_table_to_shapes(
+    table: AnnData, shapes_index: pd.Index, add_csc: bool = True, match_key: str | None = None
+) -> AnnData:
+    """The rows of ``table`` matching ``shapes_index`` (one row per shape, in the order of the shapes).
 
+    ``match_key`` is the column of ``obs`` holding the index of the shapes; default: the instance key of the table.
     With ``add_csc``, ``X`` is CSR and ``layers["X_csc"]`` is CSC with the same values (RFC 4).
     """
     from spatialdata.models import TableModel
 
     attrs = table.uns[TableModel.ATTRS_KEY]
-    instance_key = attrs["instance_key"]
-    pos = pd.Index(table.obs[instance_key].to_numpy()).get_indexer(shapes_index.to_numpy())
+    key = match_key or attrs["instance_key"]
+    pos = pd.Index(table.obs[key].to_numpy()).get_indexer(shapes_index.to_numpy())
     if np.any(pos < 0):
         raise ValueError("Some shapes are not annotated by the table.")
     t = table[pos].copy()
@@ -186,6 +189,7 @@ def build_shapes_spatial_index(
     target_shapes_per_tile: int = 1_000,
     add_csc: bool = True,
     centroids_points_name: str | None = None,
+    table_match_key: str | None = None,
 ) -> ShapesSpatialIndex:
     """Build the spatial index of RFC 4 for a shapes element of a disk-backed SpatialData object (in place).
 
@@ -197,19 +201,27 @@ def build_shapes_spatial_index(
     grid_from_points
         Use the level-0 grid of this indexed points element (RFC 4: "shapes and points of the same dataset should use
         the same grid").
+    table_match_key
+        Column of the table's ``obs`` with the index of the shapes, if the table does not annotate the shapes
+        directly (e.g. Xenium/Atera: the table annotates the cell labels and ``cell_id`` matches the boundaries).
     centroids_points_name
         Also write the centroids as a points element with the spatial index of RFC 3 (levels for the zoomed-out
         views, one of the options of RFC 4 "Levels").
     """
     from spatialdata._io.io_shapes import _read_shapes
-    from spatialdata._io.spatial_index import PointsSpatialIndex, write_points_with_spatial_index
-    from spatialdata.models import PointsModel, TableModel
-    from spatialdata.transformations import get_transformation
+    from spatialdata._io.spatial_index import PointsSpatialIndex
 
     if sdata.path is None:
         raise ValueError("The SpatialData object must be backed by a Zarr store.")
     root = Path(sdata.path)
     shapes = sdata.shapes[shapes_name]
+    if "spatial_index" in zarr.open_group(root / "shapes" / shapes_name, mode="r").attrs:
+        # already sorted (e.g. a previous run): keep it, only redo the table and the centroids
+        attrs = zarr.open_group(root / "shapes" / shapes_name, mode="r").attrs
+        md = SpatialIndexMetadata.from_dict(attrs["spatial_index"])
+        return _finish_shapes_index(
+            sdata, root, shapes_name, md, table_name, add_csc, table_match_key, centroids_points_name
+        )
     grid = None
     if grid_from_points is not None:
         grid = PointsSpatialIndex(root / "points" / grid_from_points).metadata.levels[0]
@@ -222,9 +234,31 @@ def build_shapes_spatial_index(
     tmp.rename(final)
     sdata.shapes[shapes_name] = _read_shapes(final)
 
+    return _finish_shapes_index(
+        sdata, root, shapes_name, md, table_name, add_csc, table_match_key, centroids_points_name
+    )
+
+
+def _finish_shapes_index(
+    sdata: SpatialData,
+    root: Path,
+    shapes_name: str,
+    md: SpatialIndexMetadata,
+    table_name: str | None,
+    add_csc: bool,
+    table_match_key: str | None,
+    centroids_points_name: str | None,
+) -> ShapesSpatialIndex:
+    from spatialdata._io.spatial_index import write_points_with_spatial_index
+    from spatialdata.models import PointsModel, TableModel
+    from spatialdata.transformations import get_transformation
+
+    final = root / "shapes" / shapes_name
     if table_name is not None:
         table = sdata.tables[table_name]
-        new_table = reorder_table_to_shapes(table, sdata.shapes[shapes_name].index, add_csc=add_csc)
+        new_table = reorder_table_to_shapes(
+            table, sdata.shapes[shapes_name].index, add_csc=add_csc, match_key=table_match_key
+        )
         new_table.uns[TableModel.ATTRS_KEY] = dict(table.uns[TableModel.ATTRS_KEY])
         del sdata.tables[table_name]
         sdata.tables[table_name] = TableModel.parse(new_table)

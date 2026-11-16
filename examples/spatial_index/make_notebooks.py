@@ -222,13 +222,17 @@ print("layers already present in spatialdata-db:", list(table.layers))
 spatialdata-db already ships a CSC copy (`layers["csc_counts"]`); RFC 4 names it `X_csc`. The builder writes
 `X_csc` (and leaves `csc_counts`), reorders the rows of the table to the order of the cells, and uses the grid of
 the indexed transcripts.
+
+Note: in this dataset the table annotates the cell *labels* (`region="cell_labels"`, `instance_key="label_id"`), not
+the boundaries; the boundaries are matched through the column `cell_id`. RFC 4 assumes a table annotating the
+shapes.
 """),
     code("""
-if "spatial_index" not in zarr.open_group(OUT / "shapes" / "cell_boundaries").attrs:
+if not (OUT / "points" / "cell_centroids").exists():
     t0 = time.time()
     build_shapes_spatial_index(
         sdata, "cell_boundaries", table_name="table", grid_from_points="transcripts_parquet",
-        centroids_points_name="cell_centroids",
+        centroids_points_name="cell_centroids", table_match_key="cell_id",
     )
     print(f"{time.time() - t0:.0f} s")
 index = ShapesSpatialIndex(OUT / "shapes" / "cell_boundaries", OUT / "tables" / "table")

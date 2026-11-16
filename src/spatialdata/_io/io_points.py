@@ -39,7 +39,7 @@ def _read_points(
     if not isinstance(element_store, LocalStore):
         raise TypeError(f"Reading a points element requires a local zarr store, got {type(element_store).__name__}.")
     store_root = element_store.root
-    if "spatial" in f and version == "0.3":
+    if version == "0.3-experimental":
         # RFC 3, Zarr storage: the tile-major table is a df: group
         from spatialdata._io.spatial_index import read_zarr_df_as_dask
 

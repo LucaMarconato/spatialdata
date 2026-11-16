@@ -286,11 +286,25 @@ class PointsFormatV03(FormatV05, PointsAttrsMixinV01):
     in the attributes of the element, a tile-major table (``points.parquet`` or ``spatial/points``, the ``df:``
     convention) sorted by band and tile, the ``__spatialdata_p__`` column, the tile offsets and optional
     feature-major tables. An element without ``spatial_index`` is stored as in 0.2.
+
+    This is the Parquet storage (the default of RFC 3); the Zarr storage is :class:`PointsFormatV03Experimental`.
     """
 
     @property
     def spatialdata_format_version(self) -> str:
         return "0.3"
+
+
+class PointsFormatV03Experimental(FormatV05, PointsAttrsMixinV01):
+    """Formatter for points: the Zarr storage of RFC 3 (experimental in RFC 3).
+
+    The tile-major table is a ``df:`` Zarr group ``spatial/points`` (``enum:`` for the categorical columns) instead of
+    ``points.parquet``; the metadata, the offsets and the feature-major tables are as in :class:`PointsFormatV03`.
+    """
+
+    @property
+    def spatialdata_format_version(self) -> str:
+        return "0.3-experimental"
 
 
 class TablesFormatV01(FormatV04):
@@ -317,7 +331,7 @@ CurrentSpatialDataContainerFormat = SpatialDataContainerFormatV02
 
 RasterFormatType = RasterFormatV01 | RasterFormatV02 | RasterFormatV03
 ShapesFormatType = ShapesFormatV01 | ShapesFormatV02 | ShapesFormatV03 | ShapesFormatV04
-PointsFormatType = PointsFormatV01 | PointsFormatV02 | PointsFormatV03
+PointsFormatType = PointsFormatV01 | PointsFormatV02 | PointsFormatV03 | PointsFormatV03Experimental
 TablesFormatType = TablesFormatV01 | TablesFormatV02
 SpatialDataContainerFormatType = SpatialDataContainerFormatV01 | SpatialDataContainerFormatV02
 SpatialDataFormatType = (
@@ -350,6 +364,7 @@ PointsFormats: dict[str, PointsFormatType] = {
     "0.1": PointsFormatV01(),
     "0.2": PointsFormatV02(),
     "0.3": PointsFormatV03(),
+    "0.3-experimental": PointsFormatV03Experimental(),
 }
 TablesFormats: dict[str, TablesFormatType] = {
     "0.1": TablesFormatV01(),
@@ -374,6 +389,7 @@ ContainerFormatValidElements = {
         ShapesFormatV04().__str__(),
         PointsFormatV02().__str__(),
         PointsFormatV03().__str__(),
+        PointsFormatV03Experimental().__str__(),
         TablesFormatV02().__str__(),
     ],
 }

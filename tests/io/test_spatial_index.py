@@ -77,7 +77,7 @@ def test_build_and_query(sdata_path, storage, feature_index):
     assert P_COLUMN in pts.columns
     assert pts[P_COLUMN].between(0, 1, inclusive="left").all()
     attrs = zarr.open_group(path / "points" / "transcripts").attrs.asdict()
-    assert attrs["spatialdata_attrs"]["version"] == "0.3"
+    assert attrs["spatialdata_attrs"]["version"] == {"parquet": "0.3", "zarr": "0.3-experimental"}[storage]
     assert "spatial_index" in attrs
 
     # tile-major order: sorted by band (coarsest first), tile, p

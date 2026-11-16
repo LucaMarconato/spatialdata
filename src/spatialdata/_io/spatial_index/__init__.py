@@ -84,7 +84,7 @@ def write_points_with_spatial_index(
     arguments are passed to the builder, see :func:`spatialdata._io.spatial_index._build.write_points_spatial_index`.
     """
     from spatialdata._io._utils import _write_metadata, overwrite_coordinate_transformations_non_raster
-    from spatialdata._io.format import PointsFormatV03
+    from spatialdata._io.format import PointsFormatV03, PointsFormatV03Experimental
     from spatialdata.models import get_axes_names
     from spatialdata.transformations._utils import _get_transformations
 
@@ -95,7 +95,8 @@ def write_points_with_spatial_index(
         shutil.rmtree(path)
     group = zarr.open_group(path, mode="w", zarr_format=3)
     md, stats = write_points_spatial_index(points, group, storage=storage, **kwargs)
-    fmt = PointsFormatV03()
+    # Parquet storage: points format 0.3; Zarr storage: 0.3-experimental
+    fmt = PointsFormatV03() if storage == "parquet" else PointsFormatV03Experimental()
     attrs: dict[str, Any] = dict(fmt.attrs_to_dict(points.attrs))
     attrs["version"] = fmt.spatialdata_format_version
     axes = get_axes_names(points)

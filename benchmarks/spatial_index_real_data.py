@@ -61,12 +61,15 @@ def _baseline(original: Path, element: str, feature_key: str) -> Callable[[dict[
             filters += [("x", ">=", lo[0]), ("x", "<=", hi[0]), ("y", ">=", lo[1]), ("y", "<=", hi[1])]
         if q.get("features"):
             filters += [(feature_key, "in", list(q["features"]))]
-        df = dd.read_parquet(path, columns=["x", "y", feature_key], filters=filters or None)
-        n = len(df)
-        if q.get("max_points") and n > q["max_points"]:
-            # the client has to read everything and then subsample
-            pass
-        return n
+        # read the data (len() alone would be answered from the Parquet footers)
+        pdf = dd.read_parquet(path, columns=["x", "y", feature_key], filters=filters or None).compute()
+        if q.get("box") is not None:  # filters prune row groups; rows still need the exact filter
+            lo, hi = q["box"]
+            pdf = pdf[(pdf.x >= lo[0]) & (pdf.x <= hi[0]) & (pdf.y >= lo[1]) & (pdf.y <= hi[1])]
+        if q.get("max_points") and len(pdf) > q["max_points"]:
+            # without an index the client reads everything in view and then subsamples
+            pdf = pdf.sample(q["max_points"], random_state=0)
+        return len(pdf)
 
     return run
 

@@ -40,57 +40,76 @@ def _natural_key(p: Path) -> list[Any]:
 
 
 class _ParquetTable:
-    """Random access to rows of a (multi-file) Parquet table through its row groups."""
+    """Random access to rows of a (multi-file) Parquet table through its row groups.
 
-    def __init__(self, path: Path) -> None:
-        files = sorted(path.glob("*.parquet"), key=_natural_key) if path.is_dir() else [path]
-        self.files = [pq.ParquetFile(f) for f in files]
-        rg_rows = []
-        self.rg_file: list[int] = []
-        self.rg_local: list[int] = []
-        for fi, f in enumerate(self.files):
-            for ri in range(f.metadata.num_row_groups):
-                rg_rows.append(f.metadata.row_group(ri).num_rows)
-                self.rg_file.append(fi)
-                self.rg_local.append(ri)
-        self.rg_start = np.concatenate([[0], np.cumsum(rg_rows)]).astype(np.int64)
-        self.n_rows = int(self.rg_start[-1])
+    If ``part_offsets`` (the first row of each part file, int64[n_files + 1]) is given, a file and its footer are
+    opened only when one of its rows is read; otherwise all the footers are read when the table is opened.
+    """
+
+    def __init__(self, path: Path, part_offsets: np.ndarray | None = None) -> None:
+        self.paths = sorted(path.glob("*.parquet"), key=_natural_key) if path.is_dir() else [path]
+        self._files: dict[int, pq.ParquetFile] = {}
+        self._rg_start: dict[int, np.ndarray] = {}
+        self.files_opened = 0
+        if part_offsets is None:
+            counts = [self._file(i).metadata.num_rows for i in range(len(self.paths))]
+            part_offsets = np.concatenate([[0], np.cumsum(counts)])
+        self.part_offsets = np.asarray(part_offsets, dtype=np.int64)
+        assert len(self.part_offsets) == len(self.paths) + 1
+        self.n_rows = int(self.part_offsets[-1])
         self.bytes_read = 0
         self.row_groups_read = 0
 
+    def _file(self, i: int) -> pq.ParquetFile:
+        if i not in self._files:
+            f = pq.ParquetFile(self.paths[i])
+            self._files[i] = f
+            rows = [f.metadata.row_group(r).num_rows for r in range(f.metadata.num_row_groups)]
+            self._rg_start[i] = np.concatenate([[0], np.cumsum(rows)]).astype(np.int64)
+            self.files_opened += 1
+        return self._files[i]
+
     @property
     def columns(self) -> list[str]:
-        return list(self.files[0].schema_arrow.names)
+        return list(self._file(0).schema_arrow.names)
 
     def read_ranges(self, starts: np.ndarray, stops: np.ndarray, columns: Sequence[str] | None) -> pa.Table:
         starts, stops = _merge_ranges(np.asarray(starts, np.int64), np.asarray(stops, np.int64))
         if len(starts) == 0:
-            return self.files[0].schema_arrow.empty_table().select(columns or self.columns)
-        first_rg = np.searchsorted(self.rg_start, starts, side="right") - 1
-        last_rg = np.searchsorted(self.rg_start, stops - 1, side="right") - 1
+            return self._file(0).schema_arrow.empty_table().select(list(columns) if columns else self.columns)
+        cols = list(columns) if columns else None
         pieces = []
-        cache: dict[int, pa.Table] = {}
-        for a, b, r0, r1 in zip(starts, stops, first_rg, last_rg, strict=True):
-            for r in range(int(r0), int(r1) + 1):
-                if r not in cache:
-                    f = self.files[self.rg_file[r]]
-                    cache[r] = f.read_row_group(self.rg_local[r], columns=list(columns) if columns else None)
-                    self.row_groups_read += 1
-                    self.bytes_read += sum(
-                        f.metadata.row_group(self.rg_local[r]).column(i).total_compressed_size
-                        for i in range(f.metadata.num_columns)
-                        if columns is None or f.metadata.schema.column(i).name in columns
-                    )
-                lo = max(int(a), int(self.rg_start[r])) - int(self.rg_start[r])
-                hi = min(int(b), int(self.rg_start[r + 1])) - int(self.rg_start[r])
-                pieces.append(cache[r].slice(lo, hi - lo))
-            # free row groups that later ranges cannot need (ranges are sorted)
-            for r in [r for r in cache if r < r1]:
-                del cache[r]
+        for a, b in zip(starts.tolist(), stops.tolist(), strict=True):
+            fi0 = int(np.searchsorted(self.part_offsets, a, side="right") - 1)
+            fi1 = int(np.searchsorted(self.part_offsets, b - 1, side="right") - 1)
+            for fi in range(fi0, fi1 + 1):
+                f = self._file(fi)
+                base = int(self.part_offsets[fi])
+                la, lb = max(a, base) - base, min(b, int(self.part_offsets[fi + 1])) - base
+                rg = self._rg_start[fi]
+                r0 = int(np.searchsorted(rg, la, side="right") - 1)
+                r1 = int(np.searchsorted(rg, lb - 1, side="right") - 1)
+                for r in range(r0, r1 + 1):
+                    key = (fi, r)
+                    if key != getattr(self, "_last_key", None):
+                        self._last_table = f.read_row_group(r, columns=cols)
+                        self._last_key = key
+                        self.row_groups_read += 1
+                        md = f.metadata.row_group(r)
+                        self.bytes_read += sum(
+                            md.column(i).total_compressed_size
+                            for i in range(md.num_columns)
+                            if cols is None or md.column(i).path_in_schema in cols
+                        )
+                    lo = max(la, int(rg[r])) - int(rg[r])
+                    hi = min(lb, int(rg[r + 1])) - int(rg[r])
+                    pieces.append(self._last_table.slice(lo, hi - lo))
+        self._last_key = None
+        self._last_table = None
         return pa.concat_tables(pieces)
 
     def categories(self, column: str) -> list[str]:
-        col = self.files[0].read_row_group(0, columns=[column]).column(column)
+        col = self._file(0).read_row_group(0, columns=[column]).column(column)
         if not pa.types.is_dictionary(col.type):
             raise ValueError(f"Column {column!r} is not dictionary-encoded.")
         return [str(v) for v in col.chunk(0).dictionary.to_pylist()]
@@ -154,7 +173,8 @@ class PointsSpatialIndex:
             og = self._order_group(feature_key)
             if self.storage == "parquet":
                 rel = "points.parquet" if feature_key is None else f"feature/{feature_key}/points.parquet"
-                self._tables[feature_key] = _ParquetTable(self.path / rel)
+                po = og["part_offsets"][:] if "part_offsets" in og else None
+                self._tables[feature_key] = _ParquetTable(self.path / rel, po)
             else:
                 self._tables[feature_key] = _ZarrTable(og["points"])
         return self._tables[feature_key]

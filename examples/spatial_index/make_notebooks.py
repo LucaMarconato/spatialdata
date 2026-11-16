@@ -1,0 +1,287 @@
+"""Generate the two example notebooks of the spatial index (RFC 3 points, RFC 4 shapes); run them with nbconvert."""
+
+from pathlib import Path
+
+import nbformat as nbf
+
+HERE = Path(__file__).parent
+
+
+def md(s: str):
+    return nbf.v4.new_markdown_cell(s.strip())
+
+
+def code(s: str):
+    return nbf.v4.new_code_cell(s.strip())
+
+
+points = [
+    md("""
+# Tiled and multiscale points (RFC 3): indexing an existing SpatialData object
+
+This notebook starts from a SpatialData object as it is distributed today (the 10x Atera kidney dataset of
+[spatialdata-db](https://www.spatialdata-db.com/collections/10x-atera-whole-transcriptome/), 1.19 billion transcripts)
+and writes its points again with the spatial index of
+[RFC 3](https://spatialdata-spec.scverse.org/rfcs/0003-tiled-points.html): a random priority $p$ per point, levels
+as bands, a tile-major table and a feature-major table, and their offsets. It then reads them back by region, level,
+budget and gene, and compares with reading without an index.
+
+The API is experimental (draft PR on `LucaMarconato/spatialdata`, branch `tiled-points-spatial-index`).
+"""),
+    code("""
+import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+import spatialdata as sd
+from spatialdata._io.spatial_index import PointsSpatialIndex, write_points_with_spatial_index
+
+DATA = Path("/Users/macbook/embl/projects/basel/tiled-index-data")
+SOURCE = DATA / "spatialdata_db_atera_kidney.zarr"  # points, shapes and table downloaded from spatialdata-db
+OUT = DATA / "kidney_tiled.zarr"
+"""),
+    md("## The SpatialData object as distributed"),
+    code("""
+sdata = sd.read_zarr(SOURCE, selection=("points", "shapes", "tables"))  # images were not downloaded
+sdata
+"""),
+    code("""
+points = sdata["transcripts"]
+print(points.npartitions, "partitions")
+points.dtypes
+"""),
+    md("""
+The feature column (`feature_name`) is a plain string column here; the builder turns it into a categorical with a
+global category list (RFC 3: "integer codes with the category list stored once").
+
+## A new store with the other elements
+
+The index is written as a new points element; here we put it in a new store, next to the shapes and the table, and
+leave the downloaded dataset untouched. `sd.build_points_spatial_index(sdata, name)` would instead rewrite the
+element in place (or under `new_element_name`).
+"""),
+    code("""
+if not OUT.exists():
+    sd.SpatialData(shapes=dict(sdata.shapes), tables=dict(sdata.tables)).write(OUT)
+"""),
+    md("""
+## Building the index
+
+Parquet (the default storage of RFC 3) with the sparse feature index: 24,674 features on a grid of about a million
+tiles make the dense feature index of RFC 3 (`int64[n_features, N_tiles + 1]` per band) far too large (see the
+proposed fixes). The tile size is chosen so that the densest tile of level 0 holds about 10,000 points; the levels
+follow the merge rule and the default rates.
+
+The builder works out of core: it reads the points partition by partition, scatters them to temporary buckets and
+sorts each bucket in memory.
+"""),
+    code("""
+stats_by_storage = {}
+for storage in ["parquet", "zarr"]:
+    name = f"transcripts_{storage}"
+    path = OUT / "points" / name
+    if not (path / "zarr.json").exists():
+        t0 = time.time()
+        md, stats = write_points_with_spatial_index(
+            points, path, storage=storage, feature_index="sparse", tmp_dir=DATA / "tmp", n_workers=6
+        )
+        stats_by_storage[storage] = stats
+        print(storage, f"{time.time() - t0:.0f} s")
+sd.SpatialData.read(OUT).write_consolidated_metadata()
+"""),
+    code("""
+index = PointsSpatialIndex(OUT / "points" / "transcripts_parquet")
+md = index.metadata
+for l, lv in enumerate(md.levels):
+    print(l, "tile", [round(s, 1) for s in lv.tile_size], "grid", lv.grid_shape, "P", round(lv.P, 6))
+"""),
+    md("The element reads as a normal points element (tile-major order, with the extra column `__spatialdata_p__`):"),
+    code("""
+sdata_tiled = sd.read_zarr(OUT)
+sdata_tiled["transcripts_parquet"].head()
+"""),
+    md("""
+## Reading by region, level and budget
+
+`query(box_min, box_max, level=...)` reads the bands $L, \\dots, l$ of the tiles in view. With a budget $b$ it reads
+the points with $p < b$: a uniform sample, which is a prefix of each tile.
+"""),
+    code("""
+lv0 = md.levels[0]
+origin = np.array(lv0.origin)
+extent = np.array(lv0.tile_size) * np.array(lv0.grid_shape)
+center = origin + extent / 2
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+for ax, (title, box, kw) in zip(axes, [
+    ("whole slide, 200k points", (None, None), {"budget": 200_000 / index.n_rows}),
+    ("1 mm, coarsest level that fits 200k", (center - 500, center + 500), {"budget": 200_000 / 3e7}),
+    ("100 um, all the points", (center - 50, center + 50), {}),
+]):
+    t0 = time.time()
+    df = index.query(*box, columns=["x", "y", "feature_name"], **kw)
+    ax.scatter(df.x, df.y, s=0.2, c=df.feature_name.cat.codes, cmap="tab20", rasterized=True)
+    ax.set_title(f"{title}\\n{len(df):,} points in {time.time() - t0:.2f} s")
+    ax.set_aspect("equal")
+plt.show()
+"""),
+    md("## Reading genes: feature-major vs tile-major"),
+    code("""
+counts = index.feature_ranges("feature_name", range(len(index.categories("feature_name"))))
+s, e = counts
+cats = index.categories("feature_name")
+per_gene = (e - s).reshape(md.n_levels, len(cats)).sum(axis=0)
+rare = cats[int(np.argsort(per_gene)[len(cats) // 10])]
+common = cats[int(np.argmax(per_gene))]
+print("rare:", rare, per_gene[cats.index(rare)], "common:", common, per_gene[cats.index(common)])
+"""),
+    code("""
+for gene in [rare, common]:
+    for use_feature_index in [True, False]:
+        t0 = time.time()
+        df = index.query(center - 1000, center + 1000, features=[gene], use_feature_index=use_feature_index,
+                         columns=["x", "y", "feature_name"])
+        print(f"{gene:>12} feature-major={use_feature_index!s:5} {len(df):>9,} points {time.time() - t0:6.2f} s")
+"""),
+    md("""
+## Without an index
+
+For comparison, dask with Parquet filters on the original element (the row groups of the original are not sorted
+spatially, so statistics prune little).
+"""),
+    code("""
+import dask.dataframe as dd
+
+src = SOURCE / "points" / "transcripts" / "points.parquet"
+lo, hi = center - 50, center + 50
+t0 = time.time()
+n = len(dd.read_parquet(src, columns=["x", "y"], filters=[("x", ">=", lo[0]), ("x", "<=", hi[0]),
+                                                        ("y", ">=", lo[1]), ("y", "<=", hi[1])]))
+print(f"no index: {n:,} points in {time.time() - t0:.1f} s")
+t0 = time.time()
+n = len(index.query(lo, hi, columns=["x", "y"]))
+print(f"index:    {n:,} points in {time.time() - t0:.2f} s")
+"""),
+    md("""
+## Zarr storage
+
+The same index with the points as a `df:` Zarr group (`spatial/points`, sharded), read the same way.
+"""),
+    code("""
+zindex = PointsSpatialIndex(OUT / "points" / "transcripts_zarr")
+t0 = time.time()
+df = zindex.query(center - 500, center + 500, budget=0.05, columns=["x", "y", "feature_name"])
+print(f"{len(df):,} points in {time.time() - t0:.2f} s")
+"""),
+    md("""
+## In napari
+
+With the napari-spatialdata branch `tiled-points-spatial-index`, the indexed element loads only the points in view,
+sampled down to `config.POINT_THRESHOLD`, and reloads them when the camera moves:
+
+```python
+from napari_spatialdata import Interactive
+Interactive(sd.read_zarr(OUT))
+```
+"""),
+]
+
+shapes = [
+    md("""
+# Tiled shapes and their table (RFC 4) on the Atera kidney dataset
+
+[RFC 4](https://spatialdata-spec.scverse.org/rfcs/0004-tiled-shapes.html) sorts the cells by the tile of their
+centroid, on the grid of the points (RFC 3), writes the geometry as GeoArrow, and stores the expression matrix as
+CSR and CSC. This notebook adds this index to the cells of the store made in the points notebook
+(`kidney_tiled.zarr`), reorders the table to the order of the cells, and reads cells and gene values by region.
+"""),
+    code("""
+import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import zarr
+
+import spatialdata as sd
+from spatialdata._io.spatial_index import PointsSpatialIndex, ShapesSpatialIndex, build_shapes_spatial_index
+
+DATA = Path("/Users/macbook/embl/projects/basel/tiled-index-data")
+OUT = DATA / "kidney_tiled.zarr"
+sdata = sd.read_zarr(OUT)
+sdata
+"""),
+    code("""
+table = sdata["table"]
+print(table)
+print("layers already present in spatialdata-db:", list(table.layers))
+"""),
+    md("""
+spatialdata-db already ships a CSC copy (`layers["csc_counts"]`); RFC 4 names it `X_csc`. The builder writes
+`X_csc` (and leaves `csc_counts`), reorders the rows of the table to the order of the cells, and uses the grid of
+the indexed transcripts.
+"""),
+    code("""
+if "spatial_index" not in zarr.open_group(OUT / "shapes" / "cell_boundaries").attrs:
+    t0 = time.time()
+    build_shapes_spatial_index(
+        sdata, "cell_boundaries", table_name="table", grid_from_points="transcripts_parquet",
+        centroids_points_name="cell_centroids",
+    )
+    print(f"{time.time() - t0:.0f} s")
+index = ShapesSpatialIndex(OUT / "shapes" / "cell_boundaries", OUT / "tables" / "table")
+print(index.metadata.levels[0], "margin", index.margin)
+"""),
+    md("The grid is the one of the transcripts, so one tile request can load both:"),
+    code("""
+pts = PointsSpatialIndex(OUT / "points" / "transcripts_parquet")
+print(pts.metadata.levels[0].tile_size, index.metadata.levels[0].tile_size)
+"""),
+    md("## Cells in view, colored by a gene read from the CSC layer"),
+    code("""
+lv0 = index.metadata.levels[0]
+center = np.array(lv0.origin) + np.array(lv0.tile_size) * np.array(lv0.grid_shape) / 2
+lo, hi = center - 150, center + 150
+t0 = time.time()
+cells = index.query(lo, hi)
+t1 = time.time()
+gene = index.var_names[int(np.argmax(np.asarray(sd.read_zarr(OUT)["table"].X[:2000].sum(axis=0)).ravel()))]
+values = index.gene_values(gene, cells["__row__"].to_numpy())
+t2 = time.time()
+print(f"{len(cells)} cells in {t1 - t0:.2f} s, {gene} in {t2 - t1:.2f} s")
+transcripts = pts.query(lo, hi, features=[gene], columns=["x", "y"])
+ax = cells.plot(column=values, cmap="viridis", figsize=(7, 7), legend=True)
+ax.scatter(transcripts.x, transcripts.y, s=1, c="red")
+ax.set_title(f"{gene}: cells (color) and transcripts (red)")
+plt.show()
+"""),
+    md("""
+## Zoomed out: the centroids as indexed points
+
+RFC 4 has no levels yet; one option is to show the centroids as points with the levels of RFC 3, which the builder
+wrote as `cell_centroids`:
+"""),
+    code("""
+cent = PointsSpatialIndex(OUT / "points" / "cell_centroids")
+df = cent.query(budget=50_000 / cent.n_rows)
+plt.figure(figsize=(7, 5))
+plt.scatter(df.x, df.y, s=0.3)
+plt.gca().set_aspect("equal")
+plt.title(f"{len(df):,} of {cent.n_rows:,} centroids")
+plt.show()
+"""),
+    md("""
+## In napari
+
+With the napari-spatialdata branch, the cell boundaries load by view when fewer than `config.TILED_SHAPES_MAX` cells
+are in view, and `layer.metadata["_tiled_loader"].color_by_gene(gene)` colors them from the CSC layer.
+"""),
+]
+
+for name, cells in [("tiled_points_atera.ipynb", points), ("tiled_shapes_atera.ipynb", shapes)]:
+    nb = nbf.v4.new_notebook()
+    nb.cells = cells
+    nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
+    nbf.write(nb, HERE / name)

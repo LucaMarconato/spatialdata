@@ -781,6 +781,11 @@ def write_points_spatial_index(
                 list(ex.map(sort_write, range(n_b)))
             if fk is not None:
                 writers[order].finalize_feature_index()
+            if storage == "parquet":
+                # proposed fix: the first row of each part file, so that a reader opens only the footers it needs
+                nonempty = [int(starts[b]) for b in range(n_b) if starts[b + 1] > starts[b]]
+                po = np.asarray(nonempty + [int(starts[-1])], dtype=np.int64)
+                writers[order].root.create_array("part_offsets", data=po, chunks=(max(1, len(po)),))
         stats["timings"]["sort_write"] = time.perf_counter() - t0
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)

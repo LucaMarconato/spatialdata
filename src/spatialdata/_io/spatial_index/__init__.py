@@ -69,6 +69,13 @@ def read_zarr_df_as_dask(group: zarr.Group, rows_per_partition: int = 10_000_000
     return dd.from_map(load, pairs, meta=meta, divisions=[*bounds[:-1], bounds[-1] - 1] if n else None)
 
 
+def _ensure_parent_group(path: Path) -> None:
+    """Inside a SpatialData store, make sure the element type group (e.g. ``points/``) exists as a Zarr group."""
+    root = path.parent.parent
+    if (root / "zarr.json").exists() and not (path.parent / "zarr.json").exists():
+        zarr.open_group(root, mode="a").require_group(path.parent.name)
+
+
 def write_points_with_spatial_index(
     points: dd.DataFrame,
     path: str | Path,
@@ -93,6 +100,7 @@ def write_points_with_spatial_index(
         if not overwrite:
             raise FileExistsError(f"{path} exists; pass overwrite=True.")
         shutil.rmtree(path)
+    _ensure_parent_group(path)
     group = zarr.open_group(path, mode="w", zarr_format=3)
     md, stats = write_points_spatial_index(points, group, storage=storage, **kwargs)
     # Parquet storage: points format 0.3; Zarr storage: 0.3-experimental

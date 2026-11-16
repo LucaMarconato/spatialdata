@@ -120,6 +120,9 @@ def write_shapes_with_spatial_index(
     sorted_shapes = shapes.iloc[order]
     tile_sorted = tile[order]
 
+    from spatialdata._io.spatial_index import _ensure_parent_group
+
+    _ensure_parent_group(path)
     group = zarr.open_group(path, mode="w", zarr_format=3)
     table_dir = path / "shapes.parquet"
     table_dir.mkdir(parents=True)

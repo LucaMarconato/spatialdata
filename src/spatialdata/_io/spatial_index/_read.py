@@ -233,6 +233,30 @@ class PointsSpatialIndex:
             return np.empty(0, np.int64), np.empty(0, np.int64)
         return np.concatenate(starts), np.concatenate(stops)
 
+    def estimate_count(
+        self, box_min: Sequence[float] | None = None, box_max: Sequence[float] | None = None, level: int = 0
+    ) -> float:
+        """Expected number of points in the box at a level, from the offsets only (no data read).
+
+        The points of each tile are counted in proportion to the part of the tile inside the box, which matters for
+        the large tiles of the coarse bands.
+        """
+        lo, hi = self._box(box_min, box_max)
+        total = 0.0
+        for band in range(self.metadata.L, level - 1, -1):
+            grid = self.metadata.levels[band]
+            tiles = grid.tiles_in_box(lo, hi)
+            if len(tiles) == 0:
+                continue
+            o = self._offsets(None, band).get_coordinate_selection(np.concatenate([tiles, tiles + 1]))
+            n = (o[len(tiles) :] - o[: len(tiles)]).astype(np.float64)
+            t = np.stack(np.unravel_index(tiles, grid.grid_shape), axis=1).astype(np.float64)
+            tmin = np.asarray(grid.origin) + t * np.asarray(grid.tile_size)
+            tmax = tmin + np.asarray(grid.tile_size)
+            overlap = np.clip(np.minimum(tmax, hi) - np.maximum(tmin, lo), 0, None) / np.asarray(grid.tile_size)
+            total += float(np.sum(n * np.prod(overlap, axis=1)))
+        return total
+
     def feature_ranges(
         self,
         feature_key: str,

@@ -343,6 +343,7 @@ class _OrderWriter:
         self.parquet_compression = parquet_compression
         self.root = root
         self.table_dir = table_dir
+        self.compact_dictionaries = True
         self._lock = threading.Lock()
         self.offsets_group = root.require_group("tile_offsets")
         md = plan.metadata
@@ -410,7 +411,10 @@ class _OrderWriter:
             path = self.table_dir / f"part.{start:012d}.parquet"
             with pq.ParquetWriter(path, self.schema, compression=self.parquet_compression) as w:
                 for a, b in groups:
-                    w.write_table(table.slice(a, b - a), row_group_size=b - a)
+                    piece = table.slice(a, b - a)
+                    if self.compact_dictionaries:
+                        piece = _compact_dictionaries(piece)
+                    w.write_table(piece, row_group_size=b - a)
         else:
             assert self.df_writer is not None
             # buckets may share a (sharded) chunk: a partial write is a read-modify-write, so serialize the writes
@@ -430,23 +434,31 @@ class _OrderWriter:
         ent_tile = g[key_change] - self.plan.band_base[rank[key_change]]
         ent_start = start + key_change
         ent_end = np.append(ent_start[1:], start + len(g))
-        for f_r in np.unique(ent_fr):
-            sel = ent_fr == f_r
-            feature, r = divmod(int(f_r), L + 1)
-            level = L - r
-            if self.feature_index == "sparse":
-                self._sparse[level].append(
-                    (np.full(int(sel.sum()), feature, dtype=np.int64), ent_tile[sel], ent_start[sel])
+        # ent_fr is non-decreasing (rows sorted by feature, then band): one group of entries per (feature, band)
+        last_of_group = np.append(ent_fr[1:] != ent_fr[:-1], True)
+        first_of_group = np.append(True, ent_fr[1:] != ent_fr[:-1])
+        feature_all, r_all = np.divmod(ent_fr, L + 1)
+        level_all = L - r_all
+        if self.feature_index == "sparse":
+            for level in np.unique(level_all):
+                sel = level_all == level
+                self._sparse[int(level)].append((feature_all[sel], ent_tile[sel], ent_start[sel]))
+                # the end of each (feature, band) range, marked with tile -1
+                end = sel & last_of_group
+                self._sparse[int(level)].append(
+                    (feature_all[end], np.full(int(end.sum()), -1, dtype=np.int64), ent_end[end])
                 )
-                # remember the end of the (feature, band) range
-                self._sparse[level].append((np.array([feature]), np.array([-1]), ent_end[sel][-1:]))
-            else:
-                n_t = md.levels[level].n_tiles
-                counts = np.zeros(n_t, dtype=np.int64)
-                counts[ent_tile[sel]] = ent_end[sel] - ent_start[sel]
-                row = ent_start[sel][0] + np.concatenate([[0], np.cumsum(counts)])
-                self._dense[level][feature, :] = row
-                self._dense_written.add((feature, level))
+            return
+        group_starts = np.flatnonzero(first_of_group)
+        group_ends = np.append(group_starts[1:], len(ent_fr))
+        for a, b in zip(group_starts, group_ends, strict=True):
+            feature, level = int(feature_all[a]), int(level_all[a])
+            n_t = md.levels[level].n_tiles
+            counts = np.zeros(n_t, dtype=np.int64)
+            counts[ent_tile[a:b]] = ent_end[a:b] - ent_start[a:b]
+            row = ent_start[a] + np.concatenate([[0], np.cumsum(counts)])
+            self._dense[level][feature, :] = row
+            self._dense_written.add((feature, level))
 
     _dense_written: set[tuple[int, int]]
 
@@ -509,6 +521,28 @@ class _OrderWriter:
                     compressors=_offset_compressors(),
                     filters=_offset_filters(),
                 )
+
+
+def _compact_dictionaries(table: pa.Table) -> pa.Table:
+    """Keep in the dictionary of each categorical column only the values used in this row group.
+
+    Parquet stores the dictionary of a column once per row group: with small row groups (about one tile) and
+    tens of thousands of features, a full dictionary per row group would dominate the size of the file. The global
+    categories (whose codes the feature index uses) are stored once, in ``feature/<key>/categories``.
+    """
+    cols = []
+    for i, field in enumerate(table.schema):
+        col = table.column(i)
+        if pa.types.is_dictionary(field.type) and table.num_rows:
+            arr = col.combine_chunks()
+            idx = arr.indices.to_numpy(zero_copy_only=False)
+            used, remap = np.unique(idx, return_inverse=True)
+            arr = pa.DictionaryArray.from_arrays(
+                pa.array(remap.astype(idx.dtype), type=field.type.index_type), arr.dictionary.take(pa.array(used))
+            )
+            col = pa.chunked_array([arr], type=field.type)
+        cols.append(col)
+    return pa.Table.from_arrays(cols, schema=table.schema)
 
 
 def _offset_compressors() -> Any:
@@ -707,6 +741,11 @@ def write_points_spatial_index(
             w._dense_written = set()
             writers[order] = w
         writers["tile"].write_tile_index()
+        # the global category list of each feature column, whose codes the feature index uses
+        for fk in feature_keys:
+            fg = group.require_group("feature").require_group(fk)
+            cats = np.asarray(plan.categories[fk], dtype=str)
+            fg.create_array("categories", data=cats, chunks=(max(1, len(cats)),), overwrite=True)
 
         t0 = time.perf_counter()
         for order in orders:

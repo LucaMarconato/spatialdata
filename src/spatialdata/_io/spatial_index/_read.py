@@ -141,6 +141,7 @@ class PointsSpatialIndex:
         self.storage: Literal["parquet", "zarr"] = "zarr" if "spatial" in self.group else "parquet"
         self._tables: dict[str | None, _ParquetTable | _ZarrTable] = {}
         self._offsets_cache: dict[tuple[str | None, int], Any] = {}
+        self._categories: dict[str, list[str]] = {}
 
     # --- tables and offsets ---------------------------------------------------------------------------------------
     def _order_group(self, feature_key: str | None) -> zarr.Group:
@@ -169,7 +170,15 @@ class PointsSpatialIndex:
         return self.table(None).n_rows
 
     def categories(self, feature_key: str) -> list[str]:
-        return self.table(feature_key if feature_key in self.metadata.feature_keys else None).categories(feature_key)
+        """The global categories of a feature column (the codes of the feature index index this list)."""
+        if feature_key not in self._categories:
+            fg = self.group.get("feature")
+            if fg is not None and feature_key in fg and "categories" in fg[feature_key]:
+                self._categories[feature_key] = [str(v) for v in fg[feature_key]["categories"][:]]
+            else:
+                t = self.table(feature_key if feature_key in self.metadata.feature_keys else None)
+                self._categories[feature_key] = t.categories(feature_key)
+        return self._categories[feature_key]
 
     @property
     def feature_index_layout(self) -> str:

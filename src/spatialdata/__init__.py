@@ -70,6 +70,8 @@ _LAZY_IMPORTS: dict[str, str] = {
     "build_points_spatial_index": "spatialdata._io.spatial_index",
     "read_points_spatial_index": "spatialdata._io.spatial_index",
     "write_points_with_spatial_index": "spatialdata._io.spatial_index",
+    "ShapesSpatialIndex": "spatialdata._io.spatial_index",
+    "build_shapes_spatial_index": "spatialdata._io.spatial_index",
     # _utils
     "disable_dask_tune_optimization": "spatialdata._utils",
     "get_pyramid_levels": "spatialdata._utils",
@@ -132,6 +134,8 @@ __all__ = [
     "build_points_spatial_index",
     "read_points_spatial_index",
     "write_points_with_spatial_index",
+    "ShapesSpatialIndex",
+    "build_shapes_spatial_index",
     # _utils
     "disable_dask_tune_optimization",
     "get_pyramid_levels",
@@ -204,6 +208,8 @@ if TYPE_CHECKING:
         PointsSpatialIndex,
         build_points_spatial_index,
         read_points_spatial_index,
+        ShapesSpatialIndex,
+        build_shapes_spatial_index,
         write_points_with_spatial_index,
     )
 

@@ -21,6 +21,12 @@ from spatialdata._io.spatial_index._metadata import (
     merge_rule,
 )
 from spatialdata._io.spatial_index._read import PointsSpatialIndex, read_points_spatial_index
+from spatialdata._io.spatial_index._shapes import (
+    ShapesSpatialIndex,
+    build_shapes_spatial_index,
+    reorder_table_to_shapes,
+    write_shapes_with_spatial_index,
+)
 from spatialdata._io.spatial_index._zarr_df import read_zarr_df, zarr_df_columns, zarr_df_n_rows
 
 if TYPE_CHECKING:
@@ -30,7 +36,11 @@ __all__ = [
     "P_COLUMN",
     "LevelGrid",
     "PointsSpatialIndex",
+    "ShapesSpatialIndex",
     "SpatialIndexMetadata",
+    "build_shapes_spatial_index",
+    "reorder_table_to_shapes",
+    "write_shapes_with_spatial_index",
     "build_points_spatial_index",
     "merge_rule",
     "read_points_spatial_index",

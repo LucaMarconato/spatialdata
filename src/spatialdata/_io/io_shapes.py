@@ -58,7 +58,7 @@ def _read_shapes(
             offsets = tuple(np.array(f[k]).flatten() for k in offsets_keys)
             geometry = from_ragged_array(typ, coords, offsets)
             geo_df = GeoDataFrame({"geometry": geometry}, index=index)
-    elif isinstance(shape_format, ShapesFormatV02 | ShapesFormatV03):
+    elif isinstance(shape_format, ShapesFormatV02 | ShapesFormatV03):  # also ShapesFormatV04 (a subclass of V03)
         element_store = f.store_path.store
         if not isinstance(element_store, LocalStore):
             raise TypeError(

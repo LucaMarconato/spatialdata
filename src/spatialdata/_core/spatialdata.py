@@ -1355,7 +1355,7 @@ class SpatialData:
             if not isinstance(element, GeoDataFrame):
                 raise TypeError(f"Element {element_name!r} of type {element_type!r} is not a shapes element.")
             shapes_format = parsed_formats["shapes"]
-            assert isinstance(shapes_format, ShapesFormatV01 | ShapesFormatV02 | ShapesFormatV03)
+            assert isinstance(shapes_format, ShapesFormatV01 | ShapesFormatV02 | ShapesFormatV03)  # V04 subclasses V03
             write_shapes(
                 shapes=element,
                 group=element_group,

@@ -250,6 +250,19 @@ class ShapesFormatV03(FormatV05):
         return {}
 
 
+class ShapesFormatV04(ShapesFormatV03):
+    """Formatter for shapes.
+
+    0.4 adds the optional spatial index of RFC 4 (tiled shapes): rows sorted by the tile of their centroid, the
+    ``spatial_index`` convention (with the margin), ``tile_offsets`` and a multi-file ``shapes.parquet/`` with GeoArrow
+    geometry. An element without ``spatial_index`` is stored as in 0.3.
+    """
+
+    @property
+    def spatialdata_format_version(self) -> str:
+        return "0.4"
+
+
 class PointsFormatV01(FormatV04, PointsAttrsMixinV01):
     """Formatter for points."""
 
@@ -303,7 +316,7 @@ CurrentTablesFormat = TablesFormatV02
 CurrentSpatialDataContainerFormat = SpatialDataContainerFormatV02
 
 RasterFormatType = RasterFormatV01 | RasterFormatV02 | RasterFormatV03
-ShapesFormatType = ShapesFormatV01 | ShapesFormatV02 | ShapesFormatV03
+ShapesFormatType = ShapesFormatV01 | ShapesFormatV02 | ShapesFormatV03 | ShapesFormatV04
 PointsFormatType = PointsFormatV01 | PointsFormatV02 | PointsFormatV03
 TablesFormatType = TablesFormatV01 | TablesFormatV02
 SpatialDataContainerFormatType = SpatialDataContainerFormatV01 | SpatialDataContainerFormatV02
@@ -331,6 +344,7 @@ ShapesFormats: dict[str, ShapesFormatType] = {
     "0.1": ShapesFormatV01(),
     "0.2": ShapesFormatV02(),
     "0.3": ShapesFormatV03(),
+    "0.4": ShapesFormatV04(),
 }
 PointsFormats: dict[str, PointsFormatType] = {
     "0.1": PointsFormatV01(),
@@ -357,6 +371,7 @@ ContainerFormatValidElements = {
     SpatialDataContainerFormatV02().__str__(): [
         RasterFormatV03().__str__(),
         ShapesFormatV03().__str__(),
+        ShapesFormatV04().__str__(),
         PointsFormatV02().__str__(),
         PointsFormatV03().__str__(),
         TablesFormatV02().__str__(),

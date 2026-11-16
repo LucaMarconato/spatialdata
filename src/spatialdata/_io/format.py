@@ -266,6 +266,20 @@ class PointsFormatV02(FormatV05, PointsAttrsMixinV01):
         return "0.2"
 
 
+class PointsFormatV03(FormatV05, PointsAttrsMixinV01):
+    """Formatter for points.
+
+    0.3 adds the optional spatial index of RFC 3 (tiled and multiscale points): the ``spatial_index`` Zarr convention
+    in the attributes of the element, a tile-major table (``points.parquet`` or ``spatial/points``, the ``df:``
+    convention) sorted by band and tile, the ``__spatialdata_p__`` column, the tile offsets and optional
+    feature-major tables. An element without ``spatial_index`` is stored as in 0.2.
+    """
+
+    @property
+    def spatialdata_format_version(self) -> str:
+        return "0.3"
+
+
 class TablesFormatV01(FormatV04):
     """Formatter for the table."""
 
@@ -290,7 +304,7 @@ CurrentSpatialDataContainerFormat = SpatialDataContainerFormatV02
 
 RasterFormatType = RasterFormatV01 | RasterFormatV02 | RasterFormatV03
 ShapesFormatType = ShapesFormatV01 | ShapesFormatV02 | ShapesFormatV03
-PointsFormatType = PointsFormatV01 | PointsFormatV02
+PointsFormatType = PointsFormatV01 | PointsFormatV02 | PointsFormatV03
 TablesFormatType = TablesFormatV01 | TablesFormatV02
 SpatialDataContainerFormatType = SpatialDataContainerFormatV01 | SpatialDataContainerFormatV02
 SpatialDataFormatType = (
@@ -321,6 +335,7 @@ ShapesFormats: dict[str, ShapesFormatType] = {
 PointsFormats: dict[str, PointsFormatType] = {
     "0.1": PointsFormatV01(),
     "0.2": PointsFormatV02(),
+    "0.3": PointsFormatV03(),
 }
 TablesFormats: dict[str, TablesFormatType] = {
     "0.1": TablesFormatV01(),
@@ -343,6 +358,7 @@ ContainerFormatValidElements = {
         RasterFormatV03().__str__(),
         ShapesFormatV03().__str__(),
         PointsFormatV02().__str__(),
+        PointsFormatV03().__str__(),
         TablesFormatV02().__str__(),
     ],
 }

@@ -65,6 +65,11 @@ _LAZY_IMPORTS: dict[str, str] = {
     "SpatialDataFormatType": "spatialdata._io.format",
     # _io.io_zarr
     "read_zarr": "spatialdata._io.io_zarr",
+    # experimental: spatial index of points (RFC 3)
+    "PointsSpatialIndex": "spatialdata._io.spatial_index",
+    "build_points_spatial_index": "spatialdata._io.spatial_index",
+    "read_points_spatial_index": "spatialdata._io.spatial_index",
+    "write_points_with_spatial_index": "spatialdata._io.spatial_index",
     # _utils
     "disable_dask_tune_optimization": "spatialdata._utils",
     "get_pyramid_levels": "spatialdata._utils",
@@ -123,6 +128,10 @@ __all__ = [
     "SpatialDataFormatType",
     # _io.io_zarr
     "read_zarr",
+    "PointsSpatialIndex",
+    "build_points_spatial_index",
+    "read_points_spatial_index",
+    "write_points_with_spatial_index",
     # _utils
     "disable_dask_tune_optimization",
     "get_pyramid_levels",
@@ -189,6 +198,14 @@ if TYPE_CHECKING:
 
     # _core.query._utils
     from spatialdata._core.query._utils import get_bounding_box_corners
+
+    # _io.spatial_index (experimental, RFC 3)
+    from spatialdata._io.spatial_index import (
+        PointsSpatialIndex,
+        build_points_spatial_index,
+        read_points_spatial_index,
+        write_points_with_spatial_index,
+    )
 
     # _core.query.relational_query
     from spatialdata._core.query.relational_query import (

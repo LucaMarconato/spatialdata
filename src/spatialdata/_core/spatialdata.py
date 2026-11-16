@@ -1296,6 +1296,7 @@ class SpatialData:
         from spatialdata._io.format import (
             PointsFormatV01,
             PointsFormatV02,
+            PointsFormatV03,
             RasterFormatV01,
             RasterFormatV02,
             RasterFormatV03,
@@ -1344,7 +1345,7 @@ class SpatialData:
             if not isinstance(element, DaskDataFrame):
                 raise TypeError(f"Element {element_name!r} of type {element_type!r} is not a points element.")
             points_format = parsed_formats["points"]
-            assert isinstance(points_format, PointsFormatV01 | PointsFormatV02)
+            assert isinstance(points_format, PointsFormatV01 | PointsFormatV02 | PointsFormatV03)
             write_points(
                 points=element,
                 group=element_group,

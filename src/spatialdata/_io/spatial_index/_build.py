@@ -741,8 +741,9 @@ def write_points_spatial_index(
             w._dense_written = set()
             writers[order] = w
         writers["tile"].write_tile_index()
-        # the global category list of each feature column, whose codes the feature index uses
-        for fk in feature_keys:
+        # Parquet: the global category list of each feature column, whose codes the feature index uses (in Zarr it is
+        # the enum_values of the enum: column)
+        for fk in feature_keys if storage == "parquet" else []:
             fg = group.require_group("feature").require_group(fk)
             cats = np.asarray(plan.categories[fk], dtype=str)
             fg.create_array("categories", data=cats, chunks=(max(1, len(cats)),), overwrite=True)

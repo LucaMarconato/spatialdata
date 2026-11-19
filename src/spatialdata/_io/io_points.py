@@ -39,10 +39,25 @@ def _read_points(
     if not isinstance(element_store, LocalStore):
         raise TypeError(f"Reading a points element requires a local zarr store, got {type(element_store).__name__}.")
     store_root = element_store.root
-    path = store_root / f.path / "points.parquet"
-    # cache on remote file needed for parquet reader to work
-    # TODO: allow reading in the metadata without caching all the data
-    points = read_parquet("simplecache::" + str(path) if str(path).startswith("http") else path)
+    if version == "0.3":
+        # RFC 3, Parquet format: the tile-major table is spatial/points.parquet, its part files listed in order in
+        # the Parquet sidecar
+        from spatialdata._io.spatial_index import read_metadata
+
+        _, sidecar = read_metadata(store_root / f.path)
+        assert sidecar is not None
+        files = [str(store_root / f.path / name) for name in sidecar["tables"]["spatial"]["files"]]
+        points = read_parquet(files)
+    elif version == "0.3-experimental":
+        # RFC 3, Zarr storage: the tile-major table is a df: group
+        from spatialdata._io.spatial_index import read_zarr_df_as_dask
+
+        points = read_zarr_df_as_dask(f["spatial"]["points"])
+    else:
+        path = store_root / f.path / "points.parquet"
+        # cache on remote file needed for parquet reader to work
+        # TODO: allow reading in the metadata without caching all the data
+        points = read_parquet("simplecache::" + str(path) if str(path).startswith("http") else path)
     assert isinstance(points, DaskDataFrame)
 
     ngff_transformations = f.attrs.asdict()["coordinateTransformations"]

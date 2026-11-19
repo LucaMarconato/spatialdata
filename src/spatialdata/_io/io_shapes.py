@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import pandas as pd
 import zarr
 from geopandas import GeoDataFrame, read_parquet
 from natsort import natsorted
@@ -58,15 +59,24 @@ def _read_shapes(
             offsets = tuple(np.array(f[k]).flatten() for k in offsets_keys)
             geometry = from_ragged_array(typ, coords, offsets)
             geo_df = GeoDataFrame({"geometry": geometry}, index=index)
-    elif isinstance(shape_format, ShapesFormatV02 | ShapesFormatV03):
+    elif isinstance(shape_format, ShapesFormatV02 | ShapesFormatV03):  # also ShapesFormatV04 (a subclass of V03)
         element_store = f.store_path.store
         if not isinstance(element_store, LocalStore):
             raise TypeError(
                 f"Reading a shapes element requires a local zarr store, got {type(element_store).__name__}."
             )
         store_root = element_store.root
-        path = Path(store_root) / f.path / "shapes.parquet"
-        geo_df = read_parquet(path)
+        if shape_format.spatialdata_format_version == "0.4":
+            # RFC 4: spatial/shapes.parquet, its part files listed in the Parquet sidecar
+            from spatialdata._io.spatial_index import read_metadata
+
+            _, sidecar = read_metadata(Path(store_root) / f.path)
+            assert sidecar is not None
+            files = [Path(store_root) / f.path / name for name in sidecar["tables"]["spatial"]["files"]]
+            geo_df = pd.concat([read_parquet(p) for p in files]) if len(files) > 1 else read_parquet(files[0])
+        else:
+            path = Path(store_root) / f.path / "shapes.parquet"
+            geo_df = read_parquet(path)
     else:
         raise ValueError(
             f"Unsupported shapes format {shape_format} from version {version}. Please update the spatialdata library."

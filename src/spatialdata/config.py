@@ -20,7 +20,7 @@ class Settings:
         If detected during parsing/validation, a warning is raised.
     """
 
-    shapes_geometry_encoding: Literal["WKB", "geoarrow"] = "WKB"
+    shapes_geometry_encoding: Literal["WKB", "geoarrow"] = "geoarrow"
     large_chunk_threshold_bytes: int = 2147483647
 
 

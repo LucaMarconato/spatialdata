@@ -39,9 +39,7 @@ class TimeSpatialIndexQueries:
         pts = PointsModel.parse(df, feature_key="gene", npartitions=8)
         sd.SpatialData(points={"plain": pts}).write(tmp / "data.zarr")
         for storage in ("parquet", "zarr"):
-            write_points_with_spatial_index(
-                pts, tmp / "data.zarr" / "points" / storage, storage=storage, feature_index="sparse"
-            )
+            write_points_with_spatial_index(pts, tmp / "data.zarr" / "points" / storage, storage=storage)
         return str(tmp / "data.zarr")
 
     def setup(self, path: str, storage: str, query: str) -> None:

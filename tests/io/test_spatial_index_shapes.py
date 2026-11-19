@@ -48,13 +48,15 @@ def test_build_shapes_index(sdata_cells):
     original_table = sdata["table"].copy()
     build_points_spatial_index(sdata, "transcripts", target_points_per_tile=500)
     grid_pts = PointsSpatialIndex(path / "points" / "transcripts").metadata.levels[0]
-    index = build_shapes_spatial_index(
-        sdata, "cells", table_name="table", grid_from_points="transcripts", centroids_points_name="cells_centroids"
-    )
+    index = build_shapes_spatial_index(sdata, "cells", table_name="table", nest_with_points="transcripts")
     md = index.metadata
-    # the same grid as the points
-    assert md.levels[0].tile_size == grid_pts.tile_size
-    assert md.levels[0].origin == grid_pts.origin
+    # a grid nested with the points: a power of 2 times their tile size, origin aligned to their tiles
+    ratio = md.levels[0].tile_size[0] / grid_pts.tile_size[0]
+    assert ratio >= 1 and float(np.log2(ratio)).is_integer()
+    shift = (np.asarray(grid_pts.origin[:2]) - np.asarray(md.levels[0].origin)) / grid_pts.tile_size[0]
+    assert np.allclose(shift, np.round(shift))
+    assert md.extra["fraction_within_tile"] >= 0.5
+    assert md.margin is not None and md.table == "table"
     assert zarr.open_group(path / "shapes" / "cells").attrs["spatialdata_attrs"]["version"] == "0.4"
 
     sdata2 = read_zarr(path)
@@ -85,7 +87,8 @@ def test_build_shapes_index(sdata_cells):
     m = index.table_rows(q["__row__"].to_numpy()[:10])
     assert (m != table.X[q["__row__"].to_numpy()[:10]]).nnz == 0
 
-    # the centroids as indexed points (levels for the zoomed-out view)
-    cent = PointsSpatialIndex(path / "points" / "cells_centroids")
-    assert cent.n_rows == len(cells)
-    assert cent.metadata.levels[0].tile_size == grid_pts.tile_size
+    # a table that does not annotate the shapes is refused
+    sdata3 = read_zarr(path)
+    sdata3["table"].uns["spatialdata_attrs"]["region"] = "other"
+    with pytest.raises(ValueError, match="annotates"):
+        build_shapes_spatial_index(sdata3, "cells", table_name="table")

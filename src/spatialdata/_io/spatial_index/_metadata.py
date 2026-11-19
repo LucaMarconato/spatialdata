@@ -20,11 +20,23 @@ SPATIAL_INDEX_CONVENTION = {
     "description": "Tiled and multiscale points",
 }
 P_COLUMN = "__spatialdata_p__"
-# p is drawn as an integer in [0, 2**P_BITS) and stored as the float32 value p_int / 2**P_BITS, which is exact
-P_BITS = 24
+# p = k / 2**p_bits, stored as the unsigned integer k (uint16 for 16 bits, uint32 above)
+DEFAULT_P_BITS = 16
+PARQUET_SIDECAR = "spatial_index.parquet.json"
 
 Storage = Literal["parquet", "zarr"]
-FeatureIndexLayout = Literal["dense", "sparse"]
+
+
+def p_dtype(p_bits: int) -> Any:
+    return np.uint16 if p_bits <= 16 else np.uint32
+
+
+def min_p_bits(P_min: float) -> int:
+    """The smallest of 16, 24, 32 bits such that the coarsest fraction is at least 2**(4 - bits)."""
+    for bits in (16, 24, 32):
+        if P_min >= 2.0 ** (4 - bits):
+            return bits
+    raise ValueError(f"The fraction {P_min} of the coarsest level is too small.")
 
 
 @dataclass(frozen=True)
@@ -94,6 +106,13 @@ class SpatialIndexMetadata:
     levels: tuple[LevelGrid, ...]
     feature_keys: tuple[str, ...] = ()
     version: str = SPATIAL_INDEX_VERSION
+    p_bits: int = DEFAULT_P_BITS
+    # RFC 4 (shapes): the largest overhang of a shape outside the tile of its centroid, per axis
+    margin: tuple[float, ...] | None = None
+    # RFC 4 (shapes): the table whose rows are in the order of the shapes
+    table: str | None = None
+    # Parquet only: the path of the Parquet sidecar, relative to the element
+    parquet: str | None = None
     # implementation-specific extras (not in the RFC); kept in a separate key so that they are easy to spot
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -110,8 +129,15 @@ class SpatialIndexMetadata:
             "version": self.version,
             "axes": list(self.axes),
             "feature_keys": list(self.feature_keys),
+            "p_bits": int(self.p_bits),
             "levels": [lvl.to_dict() for lvl in self.levels],
         }
+        if self.margin is not None:
+            d["margin"] = [float(v) for v in self.margin]
+        if self.table is not None:
+            d["table"] = self.table
+        if self.parquet is not None:
+            d["parquet"] = self.parquet
         if self.extra:
             d["spatialdata_extra"] = self.extra
         return d
@@ -123,6 +149,10 @@ class SpatialIndexMetadata:
             levels=tuple(LevelGrid.from_dict(lvl) for lvl in d["levels"]),
             feature_keys=tuple(d.get("feature_keys", [])),
             version=d["version"],
+            p_bits=int(d.get("p_bits", DEFAULT_P_BITS)),
+            margin=tuple(float(v) for v in d["margin"]) if "margin" in d else None,
+            table=d.get("table"),
+            parquet=d.get("parquet"),
             extra=dict(d.get("spatialdata_extra", {})),
         )
         md.validate()
@@ -145,6 +175,21 @@ class SpatialIndexMetadata:
         for fine, coarse in zip(self.levels[:-1], self.levels[1:], strict=True):
             if not refines(fine, coarse):
                 raise ValueError("spatial_index: the grid of each level must refine the grid of the next level.")
+        if self.p_bits not in (16, 24, 32):
+            raise ValueError("spatial_index: p_bits must be 16, 24 or 32.")
+        if Ps[-1] < 2.0 ** (4 - self.p_bits):
+            raise ValueError(f"spatial_index: P of the coarsest level must be at least 2^(4 - p_bits) = {2.0 ** (4 - self.p_bits)}.")
+        if self.margin is not None and len(self.margin) != d:
+            raise ValueError("spatial_index: margin must have one entry per axis.")
+
+    def thresholds(self) -> np.ndarray:
+        """P(l) * 2**p_bits, the bounds of k of each level (k < threshold)."""
+        return np.asarray([lvl.P for lvl in self.levels], dtype=np.float64) * 2.0**self.p_bits
+
+    def band_of_k(self, k: np.ndarray) -> np.ndarray:
+        """Band of each p = k / 2**p_bits: the largest l with k < P(l) * 2**p_bits."""
+        t = self.thresholds()
+        return (np.searchsorted(-t, -np.asarray(k, dtype=np.float64), side="right") - 1).astype(np.int64)
 
     def band_of(self, p: np.ndarray) -> np.ndarray:
         """Band of each p: the largest l with p < P(l)."""

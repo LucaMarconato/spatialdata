@@ -41,7 +41,7 @@ def test_real_data_queries(element):
         inside = allpts[(allpts.x >= lo[0]) & (allpts.x <= hi[0]) & (allpts.y >= lo[1]) & (allpts.y <= hi[1])]
         for level in range(md.n_levels):
             q = index.query(lo, hi, level=level, columns=["x", "y"])
-            assert len(q) == int((inside[P_COLUMN] < md.levels[level].P).sum())
+            assert len(q) == int((inside[P_COLUMN].astype(float) < md.levels[level].P * 2**md.p_bits).sum())
         if fk:
             gene = str(inside[fk].value_counts().index[0])
             a = index.query(lo, hi, features=[gene], use_feature_index=True, columns=["x", "y"])

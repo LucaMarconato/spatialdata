@@ -3,17 +3,23 @@
 The points are read partition by partition (a dask dataframe), so the input never has to fit in memory:
 
 1. pass A: bounding box and a fine histogram of the coordinates, to choose the grid (origin, tile size, levels);
-2. pass B: the priority p of each point, its band and its tile; the number of points per (band, tile), which gives
-   the tile index, and per (feature, band), which plans the feature-major order;
+2. pass B: the priority p = k / 2**p_bits of each point, its band and its tile; the number of points per (band,
+   tile), which gives the tile index, and per (feature, band), which plans the feature-major order;
 3. pass C: each partition is scattered to buckets, contiguous ranges of rows of each order, in temporary Parquet files;
 4. pass D: each bucket is sorted in memory and written to the final table (Parquet or Zarr), with its offsets.
+
+Layout (the same in both formats)::
+
+    <element>/spatial/points.parquet/ | spatial/points/      tile-major table
+    <element>/spatial/tile_offsets/<l>                       tile index
+    <element>/feature/<key>/points.parquet/ | points/        feature-major table
+    <element>/feature/<key>/tile_offsets/<l>/{feature_ptr, tile_ids, row_offsets}   feature index (sparse, CSR)
+    <element>/spatial_index.parquet.json                     Parquet only: part files, first rows, categories
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import math
 import os
 import shutil
 import tempfile
@@ -33,31 +39,28 @@ import pyarrow.parquet as pq
 import zarr
 
 from spatialdata._io.spatial_index._metadata import (
-    P_BITS,
+    DEFAULT_P_BITS,
     P_COLUMN,
-    SPATIAL_INDEX_CONVENTION,
-    SPATIAL_INDEX_KEY,
-    FeatureIndexLayout,
     LevelGrid,
     SpatialIndexMetadata,
     Storage,
     merge_rule,
+    min_p_bits,
+    p_dtype,
 )
 from spatialdata._io.spatial_index._zarr_df import ZarrDataFrameWriter
 
 logger = logging.getLogger(__name__)
 
 _G = "__sd_g__"  # temporary column: global (band, tile) id
-_PB = "__sd_pbits__"  # temporary column: bits of p (float32 viewed as uint32), sorts like p
+_K = "__sd_k__"  # temporary column: k of p = k / 2**p_bits (sorts like p)
 
-# above this number of entries the dense feature index is refused unless forced (8 GB as int64)
-DENSE_FEATURE_INDEX_MAX_ENTRIES = 1_000_000_000
+SPATIAL = "spatial"
 
 
 @dataclass
 class _Plan:
     metadata: SpatialIndexMetadata
-    grid_axes: list[str]
     feature_keys: list[str]
     categories: dict[str, list[str]]  # global categories of every categorical column
     n_rows: int
@@ -69,6 +72,11 @@ class _Plan:
     @property
     def L(self) -> int:
         return self.metadata.L
+
+    @property
+    def offset_dtype(self) -> Any:
+        # the smallest integer type that holds the row numbers (RFC 3, "Tile index")
+        return np.int32 if self.n_rows < 2**31 else np.int64
 
 
 def _ensure_dask(points: Any) -> dd.DataFrame:
@@ -88,25 +96,34 @@ def _partition(points: dd.DataFrame, i: int, columns: Sequence[str] | None = Non
     return df.reset_index(drop=True)
 
 
-def _p_bits(points_part: pd.DataFrame, seed: int, part_index: int) -> np.ndarray:
-    """The bits of the float32 p of each point (uint32, sorts like p), reused if the column exists."""
+def _k(points_part: pd.DataFrame, seed: int, part_index: int, p_bits: int, source_p_bits: int | None) -> np.ndarray:
+    """k of p = k / 2**p_bits for each point (uint32 in memory); an existing p is kept (RFC 3, "Priority").
+
+    An existing column of floats p is converted with k = floor(p * 2**p_bits); an existing column of integer codes
+    with ``source_p_bits`` bits is shifted to ``p_bits`` bits. Both keep the order of p, and the bands of the default
+    rates (powers of 2) as long as p_bits is large enough for them.
+    """
     if P_COLUMN in points_part.columns:
-        p = points_part[P_COLUMN].to_numpy(dtype=np.float32)
-        if np.any(p < 0) or np.any(p >= 1):
-            raise ValueError(f"Column {P_COLUMN} must be in [0, 1).")
-        return p.view(np.uint32)
+        col = points_part[P_COLUMN].to_numpy()
+        if np.issubdtype(col.dtype, np.floating):
+            p = col.astype(np.float64)
+            if np.any(p < 0) or np.any(p >= 1):
+                raise ValueError(f"Column {P_COLUMN} must be in [0, 1).")
+            return np.floor(p * 2.0**p_bits).astype(np.uint32)
+        src = source_p_bits or (16 if col.dtype == np.uint16 else 24)
+        k = col.astype(np.uint64)
+        k = k >> np.uint64(src - p_bits) if src >= p_bits else k << np.uint64(p_bits - src)
+        return k.astype(np.uint32)
     rng = np.random.default_rng([seed, part_index])
-    p_int = rng.integers(0, 2**P_BITS, size=len(points_part), dtype=np.uint32)
-    return (p_int.astype(np.float32) * np.float32(2.0**-P_BITS)).view(np.uint32)
+    return rng.integers(0, 2**p_bits, size=len(points_part), dtype=np.uint64).astype(np.uint32)
 
 
 def _bands_and_tiles(
-    md: SpatialIndexMetadata, coords: np.ndarray, p_bits: np.ndarray, band_base: np.ndarray
+    md: SpatialIndexMetadata, coords: np.ndarray, k: np.ndarray, band_base: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
     """Rank (L - band, coarsest first) and global (band, tile) id of each point."""
-    p = p_bits.view(np.float32)
-    band = md.band_of(p)
-    g = np.empty(len(p), dtype=np.int64)
+    band = md.band_of_k(k)
+    g = np.empty(len(k), dtype=np.int64)
     for level in range(md.n_levels):
         mask = band == level
         if mask.any():
@@ -117,18 +134,24 @@ def _bands_and_tiles(
 
 def _choose_level0(
     points: dd.DataFrame,
-    grid_axes: list[str],
+    axes: list[str],
+    tiled_axes: list[str],
     tile_size: float | Sequence[float] | None,
     origin: Sequence[float] | None,
     target_points_per_tile: int,
     n_workers: int,
 ) -> tuple[LevelGrid, int, dict[str, float]]:
-    """Pass A: bounding box, then (if no tile size is given) a fine histogram to pick an isotropic tile size."""
-    d = len(grid_axes)
+    """Pass A: bounding box, then (if no tile size is given) a fine histogram to pick the tile size.
+
+    All the ``axes`` are in the grid; the axes not in ``tiled_axes`` get a single tile. The tile size along the tiled
+    axes is isotropic and chosen so that the median number of points of the non-empty tiles of level 0 is about
+    ``target_points_per_tile`` (RFC 3, "Choosing the tile size and the rates").
+    """
     nparts = points.npartitions
+    d = len(axes)
 
     def bbox(i: int) -> tuple[np.ndarray, np.ndarray, int]:
-        c = _partition(points, i, grid_axes).to_numpy(dtype=np.float64)
+        c = _partition(points, i, axes).to_numpy(dtype=np.float64)
         if len(c) == 0:
             return np.full(d, np.inf), np.full(d, -np.inf), 0
         return c.min(axis=0), c.max(axis=0), len(c)
@@ -141,20 +164,30 @@ def _choose_level0(
     o = np.floor(lo) if origin is None else np.asarray(origin, dtype=np.float64)
     extent = np.maximum(hi - o, 1e-9)
     info: dict[str, float] = {"n_points": n}
+    ti = [axes.index(a) for a in tiled_axes]
+    dt = len(ti)
 
-    if tile_size is None:
-        # a fine histogram with bins h = (uniform-density tile size) / 16, then the smallest multiple k of h whose
-        # densest tile holds at most the target
-        s_uniform = (float(np.prod(extent)) * target_points_per_tile / max(n, 1)) ** (1.0 / d)
+    s = np.empty(d, dtype=np.float64)
+    # untiled axes: a single tile covering the extent
+    for i in range(d):
+        if i not in ti:
+            s[i] = float(np.floor(extent[i]) + 1.0)
+    if tile_size is not None:
+        given = np.broadcast_to(np.asarray(tile_size, dtype=np.float64), (dt,))
+        s[ti] = given
+    else:
+        ext_t = extent[ti]
+        s_uniform = (float(np.prod(ext_t)) * target_points_per_tile / max(n, 1)) ** (1.0 / dt)
         h = s_uniform / 16.0
-        bins = np.maximum(np.ceil(extent / h).astype(np.int64), 1)
+        bins = np.maximum(np.ceil(ext_t / h).astype(np.int64), 1)
         while np.prod(bins) > 2e8:  # keep the histogram small
             h *= 2
-            bins = np.maximum(np.ceil(extent / h).astype(np.int64), 1)
+            bins = np.maximum(np.ceil(ext_t / h).astype(np.int64), 1)
+        cols = [axes[i] for i in ti]
 
         def hist(i: int) -> np.ndarray:
-            c = _partition(points, i, grid_axes).to_numpy(dtype=np.float64)
-            t = np.clip(np.floor((c - o) / h).astype(np.int64), 0, bins - 1)
+            c = _partition(points, i, cols).to_numpy(dtype=np.float64)
+            t = np.clip(np.floor((c - o[ti]) / h).astype(np.int64), 0, bins - 1)
             return np.bincount(np.ravel_multi_index(tuple(t.T), tuple(bins)), minlength=int(np.prod(bins)))
 
         H = np.zeros(int(np.prod(bins)), dtype=np.int64)
@@ -162,23 +195,31 @@ def _choose_level0(
             for hh in ex.map(hist, range(nparts)):
                 H += hh
         H = H.reshape(tuple(bins))
-        def densest(k: int) -> int:
+
+        def blocks(k: int) -> np.ndarray:
             Hp = np.pad(H, [(0, (-b) % k) for b in bins])
             shape: list[int] = []
             for b in Hp.shape:
                 shape += [b // k, k]
-            return int(Hp.reshape(shape).sum(axis=tuple(range(1, 2 * d, 2))).max())
+            return Hp.reshape(shape).sum(axis=tuple(range(1, 2 * dt, 2)))
 
-        best_k, best_max = 1, densest(1)
-        for k in range(2, 4 * 16 + 1):
-            m = densest(k)
-            if m > target_points_per_tile:
+        best_k = 1
+        for k in range(1, 16 * 16 + 1):
+            B = blocks(k)
+            nonempty = B[B > 0]
+            best_k = k
+            if len(nonempty) and np.median(nonempty) >= target_points_per_tile:
                 break
-            best_k, best_max = k, m
-        s = np.full(d, best_k * h)
-        info["max_points_per_tile_estimate"] = float(best_max)
-    else:
-        s = np.broadcast_to(np.asarray(tile_size, dtype=np.float64), (d,)).copy()
+        B = blocks(best_k)
+        nonempty = B[B > 0]
+        s[ti] = best_k * h
+        info.update(
+            {
+                "median_points_per_tile_estimate": float(np.median(nonempty)),
+                "p90_points_per_tile_estimate": float(np.percentile(nonempty, 90)),
+                "max_points_per_tile_estimate": float(nonempty.max()),
+            }
+        )
     grid_shape = tuple(int(v) for v in np.floor(extent / s).astype(np.int64) + 1)
     return LevelGrid(tuple(o.tolist()), tuple(s.tolist()), grid_shape, 1.0), n, info
 
@@ -215,27 +256,36 @@ def _codes(df: pd.DataFrame, column: str, categories: list[str]) -> np.ndarray:
 
 def _plan(
     points: dd.DataFrame,
-    grid_axes: list[str],
+    axes: list[str],
+    tiled_axes: list[str],
     feature_keys: list[str],
     tile_size: float | Sequence[float] | None,
     origin: Sequence[float] | None,
     target_points_per_tile: int,
     n_levels: int | None,
     P: Sequence[float] | None,
+    p_bits: int | None,
+    source_p_bits: int | None,
     seed: int,
     n_workers: int,
 ) -> tuple[dd.DataFrame, _Plan]:
     t0 = time.perf_counter()
     points, categories = _global_categories(points, feature_keys)
     t1 = time.perf_counter()
-    level0, n, info = _choose_level0(points, grid_axes, tile_size, origin, target_points_per_tile, n_workers)
+    level0, n, info = _choose_level0(points, axes, tiled_axes, tile_size, origin, target_points_per_tile, n_workers)
     levels = merge_rule(level0, n_levels)
     if P is not None:
         if len(P) != len(levels):
             raise ValueError(f"P must have one entry per level ({len(levels)}), got {len(P)}.")
         levels = [LevelGrid(lv.origin, lv.tile_size, lv.grid_shape, float(p)) for lv, p in zip(levels, P, strict=True)]
+    if p_bits is None:
+        p_bits = max(DEFAULT_P_BITS, min_p_bits(levels[-1].P))
     md = SpatialIndexMetadata(
-        axes=tuple(grid_axes), levels=tuple(levels), feature_keys=tuple(feature_keys), extra={"seed": seed}
+        axes=tuple(axes),
+        levels=tuple(levels),
+        feature_keys=tuple(feature_keys),
+        p_bits=p_bits,
+        extra={"seed": seed},
     )
     md.validate()
     t2 = time.perf_counter()
@@ -245,13 +295,13 @@ def _plan(
     n_tiles_by_rank = [md.levels[L - r].n_tiles for r in range(L + 1)]
     band_base = np.concatenate([[0], np.cumsum(n_tiles_by_rank)]).astype(np.int64)
     total = int(band_base[-1])
-    columns = list(dict.fromkeys(list(grid_axes) + feature_keys + ([P_COLUMN] if P_COLUMN in points.columns else [])))
+    columns = list(dict.fromkeys(list(axes) + feature_keys + ([P_COLUMN] if P_COLUMN in points.columns else [])))
 
     def count(i: int) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         df = _partition(points, i, columns)
-        coords = df[grid_axes].to_numpy(dtype=np.float64)
-        pb = _p_bits(df, seed, i)
-        rank, g = _bands_and_tiles(md, coords, pb, band_base)
+        coords = df[list(axes)].to_numpy(dtype=np.float64)
+        k = _k(df, seed, i, p_bits, source_p_bits)
+        rank, g = _bands_and_tiles(md, coords, k, band_base)
         cg = np.bincount(g, minlength=total)
         cfr = {}
         for fk in feature_keys:
@@ -269,7 +319,6 @@ def _plan(
     t3 = time.perf_counter()
     plan = _Plan(
         metadata=md,
-        grid_axes=grid_axes,
         feature_keys=feature_keys,
         categories=categories,
         n_rows=int(counts_g.sum()),
@@ -285,7 +334,7 @@ def _plan(
 def _buckets(sizes: np.ndarray, rows_per_bucket: int) -> np.ndarray:
     """Split consecutive units with the given sizes into buckets of about rows_per_bucket rows.
 
-    Returns the bucket of each unit (non-decreasing).
+    Returns the bucket of each unit (non-decreasing). A bucket becomes one part file, so files start at units.
     """
     csum = np.cumsum(sizes)
     start = csum - sizes
@@ -315,18 +364,41 @@ def _row_groups(boundaries: np.ndarray, n_rows: int, min_rows: int, max_rows: in
     return groups
 
 
+def _offset_compressors() -> Any:
+    from zarr.codecs import BloscCodec
+
+    return [BloscCodec(cname="zstd", clevel=5, shuffle="shuffle")]
+
+
+def _offset_filters(dtype: Any) -> Any:
+    from zarr.codecs.numcodecs import Delta
+
+    return [Delta(dtype=np.dtype(dtype).str)]
+
+
+def _write_offsets(group: zarr.Group, name: str, data: np.ndarray, dtype: Any) -> None:
+    data = np.asarray(data).astype(dtype)
+    group.create_array(
+        name,
+        data=data,
+        chunks=(max(1, min(len(data), 65536)),),
+        compressors=_offset_compressors(),
+        filters=_offset_filters(dtype),
+        overwrite=True,
+    )
+
+
 class _OrderWriter:
     """Writes one order (the tile-major table or one feature-major table) bucket by bucket."""
 
     def __init__(
         self,
         root: zarr.Group,
-        table_dir: Path,
+        root_path: Path,
         storage: Storage,
         schema: pa.Schema,
         plan: _Plan,
         feature_key: str | None,
-        feature_index: FeatureIndexLayout,
         row_group_min_rows: int,
         row_group_max_rows: int,
         zarr_chunk_length: int,
@@ -337,13 +409,11 @@ class _OrderWriter:
         self.schema = schema
         self.plan = plan
         self.feature_key = feature_key
-        self.feature_index = feature_index
         self.row_group_min_rows = row_group_min_rows
         self.row_group_max_rows = row_group_max_rows
         self.parquet_compression = parquet_compression
         self.root = root
-        self.table_dir = table_dir
-        self.compact_dictionaries = True
+        self.table_dir = root_path / "points.parquet"
         self._lock = threading.Lock()
         self.offsets_group = root.require_group("tile_offsets")
         md = plan.metadata
@@ -358,22 +428,9 @@ class _OrderWriter:
             )
         else:
             self.df_writer = None
-            table_dir.mkdir(parents=True, exist_ok=True)
+            self.table_dir.mkdir(parents=True, exist_ok=True)
         # the sparse feature index, accumulated per band
         self._sparse: dict[int, list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = {lv: [] for lv in range(md.n_levels)}
-        self._dense: dict[int, zarr.Array] = {}
-        if feature_key is not None and feature_index == "dense":
-            n_features = len(plan.categories[feature_key])
-            for lv in range(md.n_levels):
-                n_t = md.levels[lv].n_tiles
-                self._dense[lv] = self.offsets_group.create_array(
-                    str(lv),
-                    shape=(n_features, n_t + 1),
-                    dtype=np.int64,
-                    chunks=(1, min(n_t + 1, 65536)),
-                    compressors=_offset_compressors(),
-                    filters=_offset_filters(),
-                )
 
     def write_tile_index(self) -> None:
         """Tile-major: offsets of every band follow from the counts."""
@@ -385,14 +442,7 @@ class _OrderWriter:
             base = self.plan.band_base[r]
             c = self.plan.counts_g[base : base + md.levels[level].n_tiles]
             offs = row + np.concatenate([[0], np.cumsum(c)]).astype(np.int64)
-            n_t = md.levels[level].n_tiles
-            self.offsets_group.create_array(
-                str(level),
-                data=offs,
-                chunks=(min(n_t + 1, 65536),),
-                compressors=_offset_compressors(),
-                filters=_offset_filters(),
-            )
+            _write_offsets(self.offsets_group, str(level), offs, self.plan.offset_dtype)
             row = int(offs[-1])
 
     def write_bucket(self, start: int, table: pa.Table, g: np.ndarray, codes: np.ndarray | None) -> None:
@@ -408,13 +458,10 @@ class _OrderWriter:
         boundaries = np.flatnonzero(np.diff(unit, prepend=unit[0] - 1))
         if self.storage == "parquet":
             groups = _row_groups(boundaries, n, self.row_group_min_rows, self.row_group_max_rows)
-            path = self.table_dir / f"part.{start:012d}.parquet"
+            path = self.table_dir / _part_name(start)
             with pq.ParquetWriter(path, self.schema, compression=self.parquet_compression) as w:
                 for a, b in groups:
-                    piece = table.slice(a, b - a)
-                    if self.compact_dictionaries:
-                        piece = _compact_dictionaries(piece)
-                    w.write_table(piece, row_group_size=b - a)
+                    w.write_table(_compact_dictionaries(table.slice(a, b - a)), row_group_size=b - a)
         else:
             assert self.df_writer is not None
             # buckets may share a (sharded) chunk: a partial write is a read-modify-write, so serialize the writes
@@ -424,8 +471,7 @@ class _OrderWriter:
             self._feature_index(start, g, codes)
 
     def _feature_index(self, start: int, g: np.ndarray, codes: np.ndarray) -> None:
-        md = self.plan.metadata
-        L = md.L
+        L = self.plan.L
         rank = np.searchsorted(self.plan.band_base, g, side="right") - 1
         fr = codes * (L + 1) + rank
         # one entry per (feature, rank, tile) present
@@ -436,10 +482,9 @@ class _OrderWriter:
         ent_end = np.append(ent_start[1:], start + len(g))
         # ent_fr is non-decreasing (rows sorted by feature, then band): one group of entries per (feature, band)
         last_of_group = np.append(ent_fr[1:] != ent_fr[:-1], True)
-        first_of_group = np.append(True, ent_fr[1:] != ent_fr[:-1])
         feature_all, r_all = np.divmod(ent_fr, L + 1)
         level_all = L - r_all
-        if self.feature_index == "sparse":
+        with self._lock:
             for level in np.unique(level_all):
                 sel = level_all == level
                 self._sparse[int(level)].append((feature_all[sel], ent_tile[sel], ent_start[sel]))
@@ -448,21 +493,9 @@ class _OrderWriter:
                 self._sparse[int(level)].append(
                     (feature_all[end], np.full(int(end.sum()), -1, dtype=np.int64), ent_end[end])
                 )
-            return
-        group_starts = np.flatnonzero(first_of_group)
-        group_ends = np.append(group_starts[1:], len(ent_fr))
-        for a, b in zip(group_starts, group_ends, strict=True):
-            feature, level = int(feature_all[a]), int(level_all[a])
-            n_t = md.levels[level].n_tiles
-            counts = np.zeros(n_t, dtype=np.int64)
-            counts[ent_tile[a:b]] = ent_end[a:b] - ent_start[a:b]
-            row = ent_start[a] + np.concatenate([[0], np.cumsum(counts)])
-            self._dense[level][feature, :] = row
-            self._dense_written.add((feature, level))
-
-    _dense_written: set[tuple[int, int]]
 
     def finalize_feature_index(self) -> None:
+        """Per band, CSR over the features of their non-empty tiles (RFC 3, "Feature index")."""
         md = self.plan.metadata
         L = md.L
         fk = self.feature_key
@@ -471,15 +504,6 @@ class _OrderWriter:
         # start row of every (feature, rank) range, also the empty ones
         cfr = self.plan.counts_fr[fk]
         fr_start = (np.cumsum(cfr.ravel()) - cfr.ravel()).reshape(cfr.shape)
-        if self.feature_index == "dense":
-            for level in range(md.n_levels):
-                r = L - level
-                n_t = md.levels[level].n_tiles
-                for feature in range(n_features):
-                    if (feature, level) not in self._dense_written:
-                        self._dense[level][feature, :] = np.full(n_t + 1, fr_start[feature, r], dtype=np.int64)
-            return
-        # sparse (proposed fix, not in RFC 3): per band, CSR over features of the non-empty tiles
         for level in range(md.n_levels):
             r = L - level
             parts = self._sparse[level]
@@ -498,9 +522,7 @@ class _OrderWriter:
             # row_offsets: for feature f, entries feature_ptr[f] + f ... feature_ptr[f + 1] + f (inclusive): the
             # start of each non-empty tile, then the end of the (feature, band) range
             row_offsets = np.empty(len(tiles) - int(is_end.sum()) + n_features, dtype=np.int64)
-            has_any = np.zeros(n_features, dtype=bool)
-            has_any[feats[is_end]] = True
-            # features without points in this band: a single entry, the start of their (empty) range
+            # features without points in this band: a single entry, the row where their (empty) range would start
             pos_end = feature_ptr[1:] + np.arange(n_features)
             row_offsets[pos_end] = fr_start[:, r]
             row_offsets[pos_end[feats[is_end]]] = rows[is_end]
@@ -508,53 +530,33 @@ class _OrderWriter:
             mask[pos_end] = False
             row_offsets[mask] = rows[~is_end]
             g = self.offsets_group.require_group(str(level))
-            g.attrs["layout"] = "sparse-csr"
-            for name, data in (
-                ("feature_ptr", feature_ptr),
-                ("tile_ids", tiles[~is_end]),
-                ("row_offsets", row_offsets),
-            ):
-                g.create_array(
-                    name,
-                    data=data,
-                    chunks=(max(1, min(len(data), 65536)),),
-                    compressors=_offset_compressors(),
-                    filters=_offset_filters(),
-                )
+            dtype = self.plan.offset_dtype
+            tile_dtype = np.int32 if md.levels[level].n_tiles < 2**31 else np.int64
+            _write_offsets(g, "feature_ptr", feature_ptr, dtype)
+            _write_offsets(g, "tile_ids", tiles[~is_end], tile_dtype)
+            _write_offsets(g, "row_offsets", row_offsets, dtype)
 
 
 def _compact_dictionaries(table: pa.Table) -> pa.Table:
     """Keep in the dictionary of each categorical column only the values used in this row group.
 
-    Parquet stores the dictionary of a column once per row group: with small row groups (about one tile) and
-    tens of thousands of features, a full dictionary per row group would dominate the size of the file. The global
-    categories (whose codes the feature index uses) are stored once, in ``feature/<key>/categories``.
+    Parquet stores the dictionary of a column once per row group: with tens of thousands of features, a full dictionary
+    per row group would dominate the size of the file. The global categories (whose codes the feature index uses) are
+    stored once, in the Parquet sidecar.
     """
     cols = []
-    for i, field in enumerate(table.schema):
+    for i, f in enumerate(table.schema):
         col = table.column(i)
-        if pa.types.is_dictionary(field.type) and table.num_rows:
+        if pa.types.is_dictionary(f.type) and table.num_rows:
             arr = col.combine_chunks()
             idx = arr.indices.to_numpy(zero_copy_only=False)
             used, remap = np.unique(idx, return_inverse=True)
             arr = pa.DictionaryArray.from_arrays(
-                pa.array(remap.astype(idx.dtype), type=field.type.index_type), arr.dictionary.take(pa.array(used))
+                pa.array(remap.astype(idx.dtype), type=f.type.index_type), arr.dictionary.take(pa.array(used))
             )
-            col = pa.chunked_array([arr], type=field.type)
+            col = pa.chunked_array([arr], type=f.type)
         cols.append(col)
     return pa.Table.from_arrays(cols, schema=table.schema)
-
-
-def _offset_compressors() -> Any:
-    from zarr.codecs import BloscCodec
-
-    return [BloscCodec(cname="zstd", clevel=5, shuffle="shuffle")]
-
-
-def _offset_filters() -> Any:
-    from zarr.codecs.numcodecs import Delta
-
-    return [Delta(dtype="<i8")]
 
 
 def _output_schema(points: dd.DataFrame, plan: _Plan, drop: Sequence[str]) -> pa.Schema:
@@ -563,8 +565,9 @@ def _output_schema(points: dd.DataFrame, plan: _Plan, drop: Sequence[str]) -> pa
     for c, cats in plan.categories.items():
         if c in meta.columns:
             meta[c] = meta[c].astype(pd.CategoricalDtype(cats))
-    meta[P_COLUMN] = pd.Series([], dtype=np.float32)
-    first = [*plan.grid_axes]
+    meta[P_COLUMN] = pd.Series([], dtype=p_dtype(plan.metadata.p_bits))
+    # the commonly projected columns first (RFC 3, "Order of the columns")
+    first = [*plan.metadata.axes]
     first += [c for c in ("x", "y", "z") if c in meta.columns and c not in first]
     first += [*plan.feature_keys, P_COLUMN]
     order = list(dict.fromkeys(first + [n for n in meta.columns if n not in first]))
@@ -572,13 +575,13 @@ def _output_schema(points: dd.DataFrame, plan: _Plan, drop: Sequence[str]) -> pa
     return pa.Schema.from_pandas(meta[order], preserve_index=False)
 
 
-def _to_table(df: pd.DataFrame, schema: pa.Schema, plan: _Plan, p_bits: np.ndarray) -> pa.Table:
+def _to_table(df: pd.DataFrame, schema: pa.Schema, plan: _Plan, k: np.ndarray) -> pa.Table:
     df = df.copy()
     for c, cats in plan.categories.items():
         if c in df.columns:
             if not isinstance(df[c].dtype, pd.CategoricalDtype) or list(df[c].cat.categories) != cats:
                 df[c] = df[c].astype(str).astype(pd.CategoricalDtype(cats))
-    df[P_COLUMN] = p_bits.view(np.float32)
+    df[P_COLUMN] = k.astype(p_dtype(plan.metadata.p_bits))
     t = pa.Table.from_pandas(df[schema.names], preserve_index=False)
     return t.cast(schema)
 
@@ -589,17 +592,18 @@ def write_points_spatial_index(
     *,
     storage: Storage = "parquet",
     axes: Sequence[str] | None = None,
+    tiled_axes: Sequence[str] | None = None,
     feature_keys: Sequence[str] | None = None,
     tile_size: float | Sequence[float] | None = None,
     origin: Sequence[float] | None = None,
     target_points_per_tile: int = 10_000,
     n_levels: int | None = None,
     P: Sequence[float] | None = None,
+    p_bits: int | None = None,
+    source_p_bits: int | None = None,
     seed: int = 0,
-    feature_index: FeatureIndexLayout = "dense",
-    force_dense_feature_index: bool = False,
     rows_per_bucket: int = 20_000_000,
-    row_group_min_rows: int | None = None,
+    row_group_min_rows: int = 250_000,
     row_group_max_rows: int = 1_048_576,
     zarr_chunk_length: int | None = None,
     zarr_shard_length: int | None = 2_097_152,
@@ -611,48 +615,67 @@ def write_points_spatial_index(
 ) -> tuple[SpatialIndexMetadata, dict[str, Any]]:
     """Write the tables and offsets of the spatial index of RFC 3 into an (empty) element group.
 
-    Only the data of the index is written (``points.parquet`` / ``spatial/``, ``tile_offsets``, ``feature/``); the
-    caller writes the element metadata (transformations, ``spatialdata_attrs``) and the ``spatial_index`` attributes,
-    which this function returns.
+    Only the data of the index is written (``spatial/``, ``feature/``); the caller writes the element metadata
+    (transformations, ``spatialdata_attrs``), the ``spatial_index`` attributes and, for Parquet, the sidecar, from the
+    returned metadata and statistics (``stats["parquet_sidecar"]``).
+
+    Parameters
+    ----------
+    axes
+        All the spatial axes of the element (default: ``x``, ``y`` and ``z`` if present).
+    tiled_axes
+        The axes with more than one tile (default: ``x`` and ``y``); the others get a single tile.
+    target_points_per_tile
+        Target for the median number of points of the non-empty tiles of level 0.
+    p_bits
+        Precision of p (16, 24 or 32); default: 16, or more if the coarsest level needs it.
+    source_p_bits
+        Precision of an existing integer ``__spatialdata_p__`` column (default: 16 for uint16, 24 for uint32).
+    row_group_min_rows, row_group_max_rows
+        Parquet row groups hold several tiles (at least ``row_group_min_rows`` rows) and split larger tiles.
 
     Returns
     -------
-    The metadata of the index and a dictionary of statistics (timings, sizes).
+    The metadata of the index and a dictionary of statistics (timings, sizes, and the Parquet sidecar).
     """
     log = progress or (lambda msg: logger.info(msg))
     points = _ensure_dask(points)
     n_workers = n_workers or max(1, min(8, (os.cpu_count() or 2) // 2))
     if axes is None:
-        axes = [a for a in ("x", "y") if a in points.columns]
-    grid_axes = list(axes)
+        axes = [a for a in ("x", "y", "z") if a in points.columns]
+    axes = list(axes)
+    if tiled_axes is None:
+        tiled_axes = [a for a in ("x", "y") if a in axes]
+    tiled_axes = list(tiled_axes)
     if feature_keys is None:
         fk = points.attrs.get("spatialdata_attrs", {}).get("feature_key")
         feature_keys = [fk] if fk is not None else []
     feature_keys = list(feature_keys)
-    if row_group_min_rows is None:
-        row_group_min_rows = target_points_per_tile
     if zarr_chunk_length is None:
         zarr_chunk_length = target_points_per_tile
 
     t_start = time.perf_counter()
     log("planning the grid and counting the points per tile")
     points, plan = _plan(
-        points, grid_axes, feature_keys, tile_size, origin, target_points_per_tile, n_levels, P, seed, n_workers
+        points,
+        axes,
+        tiled_axes,
+        feature_keys,
+        tile_size,
+        origin,
+        target_points_per_tile,
+        n_levels,
+        P,
+        p_bits,
+        source_p_bits,
+        seed,
+        n_workers,
     )
     md = plan.metadata
     stats: dict[str, Any] = {"timings": dict(plan.timings), "n_rows": plan.n_rows, "n_levels": md.n_levels}
-    for fk in feature_keys:
-        n_entries = len(plan.categories[fk]) * sum(lv.n_tiles + 1 for lv in md.levels)
-        stats[f"dense_feature_index_entries[{fk}]"] = n_entries
-        if feature_index == "dense" and n_entries > DENSE_FEATURE_INDEX_MAX_ENTRIES and not force_dense_feature_index:
-            raise ValueError(
-                f"The dense feature index of {fk!r} would have {n_entries:,} entries "
-                f"({len(plan.categories[fk]):,} features x {sum(lv.n_tiles for lv in md.levels):,} tiles); use "
-                "feature_index='sparse' or force_dense_feature_index=True."
-            )
     log(
         f"{plan.n_rows:,} points, {md.n_levels} levels, level 0 grid {md.levels[0].grid_shape} of tile size "
-        f"{md.levels[0].tile_size}"
+        f"{md.levels[0].tile_size}, p_bits {md.p_bits}"
     )
 
     schema = _output_schema(points, plan, drop_columns)
@@ -675,23 +698,24 @@ def write_points_spatial_index(
         np.add.at(s, b + 1, sizes)
         bucket_start_f[fk] = np.cumsum(s)
 
+    root_path = _local_path(group)
     tmp_root = Path(tempfile.mkdtemp(prefix="spatial_index_", dir=tmp_dir))
     stats["tmp_dir"] = str(tmp_root)
+    orders = [SPATIAL] + [f"feature/{fk}" for fk in feature_keys]
     try:
         # pass C: scatter
         t0 = time.perf_counter()
         log(f"scattering {points.npartitions} partitions to buckets in {tmp_root}")
-        orders = ["tile"] + [f"feature/{fk}" for fk in feature_keys]
 
         def scatter(i: int) -> int:
             df = _partition(points, i, in_columns)
-            pb = _p_bits(df, seed, i)
-            coords = df[grid_axes].to_numpy(dtype=np.float64)
-            rank, g = _bands_and_tiles(md, coords, pb, plan.band_base)
-            table = _to_table(df.drop(columns=[P_COLUMN], errors="ignore"), schema, plan, pb)
-            table = table.append_column(_G, pa.array(g)).append_column(_PB, pa.array(pb))
+            k = _k(df, seed, i, md.p_bits, source_p_bits)
+            coords = df[axes].to_numpy(dtype=np.float64)
+            rank, g = _bands_and_tiles(md, coords, k, plan.band_base)
+            table = _to_table(df.drop(columns=[P_COLUMN], errors="ignore"), schema, plan, k)
+            table = table.append_column(_G, pa.array(g)).append_column(_K, pa.array(k))
             for order in orders:
-                if order == "tile":
+                if order == SPATIAL:
                     bucket = bucket_of_g[g]
                 else:
                     fk = order.split("/", 1)[1]
@@ -715,42 +739,29 @@ def write_points_spatial_index(
         stats["tmp_bytes"] = sum(f.stat().st_size for f in tmp_root.rglob("*.parquet"))
 
         # pass D: sort each bucket and write
-        root_tile = group if storage == "parquet" else group.require_group("spatial")
         writers: dict[str, _OrderWriter] = {}
         for order in orders:
-            fk_or_none = None if order == "tile" else order.split("/", 1)[1]
-            if storage == "parquet":
-                og = group if order == "tile" else group.require_group(order)
-            else:
-                og = root_tile if order == "tile" else group.require_group(order)
-            table_dir = _local_path(og) / "points.parquet"
-            w = _OrderWriter(
+            fk_or_none = None if order == SPATIAL else order.split("/", 1)[1]
+            og = group.require_group(order)
+            writers[order] = _OrderWriter(
                 og,
-                table_dir,
+                root_path / order,
                 storage,
                 schema,
                 plan,
                 fk_or_none,
-                feature_index,
                 row_group_min_rows,
                 row_group_max_rows,
                 zarr_chunk_length,
                 zarr_shard_length,
                 parquet_compression,
             )
-            w._dense_written = set()
-            writers[order] = w
-        writers["tile"].write_tile_index()
-        # Parquet: the global category list of each feature column, whose codes the feature index uses (in Zarr it is
-        # the enum_values of the enum: column)
-        for fk in feature_keys if storage == "parquet" else []:
-            fg = group.require_group("feature").require_group(fk)
-            cats = np.asarray(plan.categories[fk], dtype=str)
-            fg.create_array("categories", data=cats, chunks=(max(1, len(cats)),), overwrite=True)
+        writers[SPATIAL].write_tile_index()
+        sidecar: dict[str, Any] = {"tables": {}}
 
         t0 = time.perf_counter()
         for order in orders:
-            fk = None if order == "tile" else order.split("/", 1)[1]
+            fk = None if order == SPATIAL else order.split("/", 1)[1]
             starts = bucket_start_t if fk is None else bucket_start_f[fk]
             n_b = len(starts) - 1
             log(f"sorting and writing {n_b} buckets of the {order} order")
@@ -762,39 +773,46 @@ def write_points_spatial_index(
                 files = sorted(d.glob("*.parquet"))
                 t = pa.concat_tables([pq.read_table(f) for f in files])
                 g = t.column(_G).to_numpy()
-                pb = t.column(_PB).to_numpy()
+                kk = t.column(_K).to_numpy()
                 if fk is None:
-                    idx = np.lexsort((pb, g))
+                    idx = np.lexsort((kk, g))
                     codes = None
                 else:
                     codes_all = t.column(fk).combine_chunks().indices.to_numpy().astype(np.int64)
-                    idx = np.lexsort((pb, g, codes_all))
+                    idx = np.lexsort((kk, g, codes_all))
                     codes = codes_all[idx]
-                t = t.take(pa.array(idx)).drop_columns([_G, _PB]).cast(schema)
+                t = t.take(pa.array(idx)).drop_columns([_G, _K]).cast(schema)
                 assert t.num_rows == starts[b + 1] - starts[b]
                 writers[order].write_bucket(int(starts[b]), t, g[idx], codes)
                 shutil.rmtree(d)
 
-            # dense feature indices write rows of a shared zarr array: one bucket at a time is safest
-            workers = 1 if (fk is not None and feature_index == "dense") else max(1, n_workers // 2)
-            with ThreadPoolExecutor(workers) as ex:
+            with ThreadPoolExecutor(max(1, n_workers // 2)) as ex:
                 list(ex.map(sort_write, range(n_b)))
             if fk is not None:
                 writers[order].finalize_feature_index()
             if storage == "parquet":
-                # proposed fix: the first row of each part file, so that a reader opens only the footers it needs
+                # the part files in order and the first row of each, so that a reader neither lists the directory
+                # nor opens the footers it does not need (the Parquet sidecar)
                 nonempty = [int(starts[b]) for b in range(n_b) if starts[b + 1] > starts[b]]
-                po = np.asarray(nonempty + [int(starts[-1])], dtype=np.int64)
-                writers[order].root.create_array("part_offsets", data=po, chunks=(max(1, len(po)),))
+                entry: dict[str, Any] = {
+                    "files": [f"{order}/points.parquet/{_part_name(r)}" for r in nonempty],
+                    "first_row": nonempty + [int(starts[-1])],
+                }
+                if fk is not None:
+                    entry["categories"] = list(plan.categories[fk])
+                sidecar["tables"][order] = entry
         stats["timings"]["sort_write"] = time.perf_counter() - t0
+        if storage == "parquet":
+            stats["parquet_sidecar"] = sidecar
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
     stats["timings"]["total"] = time.perf_counter() - t_start
-    if feature_index == "sparse" and feature_keys:
-        md = SpatialIndexMetadata(
-            md.axes, md.levels, md.feature_keys, md.version, {**md.extra, "feature_index_layout": "sparse-csr"}
-        )
     return md, stats
+
+
+def _part_name(first_row: int) -> str:
+    """Zero-padded, so that tools that list and sort the directory (dask, pyarrow) read the files in order."""
+    return f"part.{first_row:012d}.parquet"
 
 
 def _local_path(group: zarr.Group) -> Path:
@@ -806,15 +824,4 @@ def _local_path(group: zarr.Group) -> Path:
     return Path(store.root) / group.path
 
 
-def write_spatial_index_attrs(group: zarr.Group, md: SpatialIndexMetadata) -> None:
-    attrs = group.attrs.asdict()
-    conventions = [c for c in attrs.get("zarr_conventions", []) if c.get("name") != SPATIAL_INDEX_KEY]
-    conventions.append(SPATIAL_INDEX_CONVENTION)
-    group.attrs.update({"zarr_conventions": conventions, SPATIAL_INDEX_KEY: md.to_dict()})
-
-
-def summarize(md: SpatialIndexMetadata) -> str:
-    return json.dumps(md.to_dict(), indent=2)
-
-
-__all__ = ["write_points_spatial_index", "write_spatial_index_attrs", "math"]
+__all__ = ["write_points_spatial_index"]

@@ -69,10 +69,10 @@ if not OUT.exists():
     md("""
 ## Building the index
 
-Parquet (the default storage of RFC 3) with the sparse feature index: 24,674 features on a grid of about a million
-tiles make the dense feature index of RFC 3 (`int64[n_features, N_tiles + 1]` per band) far too large (see the
-proposed fixes). The tile size is chosen so that the densest tile of level 0 holds about 10,000 points; the levels
-follow the merge rule and the default rates.
+Both formats of RFC 3: Parquet (points format 0.3, the default) and Zarr (0.3-experimental), with the same layout.
+The grid has all the axes of the points (x, y and a single tile along z); the tile size is chosen so that the
+median non-empty tile of level 0 holds about 10,000 points; the levels follow the merge rule and the default rates;
+p is stored as 16-bit integers; Parquet row groups hold several tiles (at least 250,000 rows).
 
 The builder works out of core: it reads the points partition by partition, scatters them to temporary buckets and
 sorts each bucket in memory.
@@ -85,7 +85,7 @@ for storage in ["parquet", "zarr"]:
     if not (path / "zarr.json").exists():
         t0 = time.time()
         md, stats = write_points_with_spatial_index(
-            points, path, storage=storage, feature_index="sparse", tmp_dir=DATA / "tmp", n_workers=6
+            points, path, storage=storage, tmp_dir=DATA / "tmp", n_workers=6
         )
         stats_by_storage[storage] = stats
         print(storage, f"{time.time() - t0:.0f} s")
@@ -96,6 +96,7 @@ index = PointsSpatialIndex(OUT / "points" / "transcripts_parquet")
 md = index.metadata
 for l, lv in enumerate(md.levels):
     print(l, "tile", [round(s, 1) for s in lv.tile_size], "grid", lv.grid_shape, "P", round(lv.P, 6))
+print("p_bits", md.p_bits)
 """),
     md("The element reads as a normal points element (tile-major order, with the extra column `__spatialdata_p__`):"),
     code("""
@@ -193,7 +194,7 @@ shapes = [
 # Tiled shapes and their table (RFC 4) on the Atera kidney dataset
 
 [RFC 4](https://spatialdata-spec.scverse.org/rfcs/0004-tiled-shapes.html) sorts the cells by the tile of their
-centroid, on the grid of the points (RFC 3), writes the geometry as GeoArrow, and stores the expression matrix as
+centroid, on a grid of their own nested with the grid of the points, writes the geometry as GeoArrow, and stores the expression matrix as
 CSR and CSC. This notebook adds this index to the cells of the store made in the points notebook
 (`kidney_tiled.zarr`), reorders the table to the order of the cells, and reads cells and gene values by region.
 """),
@@ -203,6 +204,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import zarr
 
 import spatialdata as sd
@@ -220,23 +222,29 @@ print("layers already present in spatialdata-db:", list(table.layers))
 """),
     md("""
 spatialdata-db already ships a CSC copy (`layers["csc_counts"]`); RFC 4 names it `X_csc`. The builder writes
-`X_csc` (and leaves `csc_counts`), reorders the rows of the table to the order of the cells, and uses the grid of
-the indexed transcripts.
+`X_csc` (and leaves `csc_counts`) and reorders the rows of the table to the order of the cells. Its grid is nested
+with the grid of the transcripts: a power of 2 times their tile size, the smallest one where more than half of the
+cells lie within the tile of their centroid (RFC 4, "When to use it").
 
-Note: in this dataset the table annotates the cell *labels* (`region="cell_labels"`, `instance_key="label_id"`), not
-the boundaries; the boundaries are matched through the column `cell_id`. RFC 4 assumes a table annotating the
-shapes.
+RFC 4 applies to a table that annotates the shapes. In this dataset the table annotates the cell *labels*
+(`region="cell_labels"`, `instance_key="label_id"`), and the boundaries are matched through the column `cell_id`:
+making the table annotate the boundaries is up to the user, done here first.
 """),
     code("""
-if not (OUT / "points" / "cell_centroids").exists():
+if "spatial_index" not in zarr.open_group(OUT / "shapes" / "cell_boundaries").attrs:
+    # make the table annotate the cell boundaries (the user's responsibility, RFC 4)
+    from spatialdata.models import TableModel
+
+    t = sdata["table"]
+    t.obs["region"] = pd.Categorical(["cell_boundaries"] * t.n_obs)
+    t.uns[TableModel.ATTRS_KEY].update({"region": "cell_boundaries", "instance_key": "cell_id"})
+    sdata.delete_element_from_disk("table")
+    sdata.write_element("table")
     t0 = time.time()
-    build_shapes_spatial_index(
-        sdata, "cell_boundaries", table_name="table", grid_from_points="transcripts_parquet",
-        centroids_points_name="cell_centroids", table_match_key="cell_id",
-    )
+    build_shapes_spatial_index(sdata, "cell_boundaries", table_name="table", nest_with_points="transcripts_parquet")
     print(f"{time.time() - t0:.0f} s")
 index = ShapesSpatialIndex(OUT / "shapes" / "cell_boundaries", OUT / "tables" / "table")
-print(index.metadata.levels[0], "margin", index.margin)
+print(index.metadata.levels[0], "margin", index.margin, "within tile", index.metadata.extra["fraction_within_tile"])
 """),
     md("""
 The grid is the one of the transcripts, so one tile request can load both. Note the margin: the largest overhang of
@@ -266,19 +274,10 @@ ax.set_title(f"{gene}: cells (color) and transcripts (red)")
 plt.show()
 """),
     md("""
-## Zoomed out: the centroids as indexed points
+## Zoomed out
 
-RFC 4 has no levels yet; one option is to show the centroids as points with the levels of RFC 3, which the builder
-wrote as `cell_centroids`:
-"""),
-    code("""
-cent = PointsSpatialIndex(OUT / "points" / "cell_centroids")
-df = cent.query(budget=50_000 / cent.n_rows)
-plt.figure(figsize=(7, 5))
-plt.scatter(df.x, df.y, s=0.3)
-plt.gca().set_aspect("equal")
-plt.title(f"{len(df):,} of {cent.n_rows:,} centroids")
-plt.show()
+RFC 4 has a single level for now: zoomed out, a client shows fewer cells by other means (aggregation, or the
+transcripts alone). napari-spatialdata loads the cells only when at most `config.TILED_SHAPES_MAX` are in view.
 """),
     md("""
 ## In napari

@@ -11,10 +11,10 @@ import dask.dataframe as dd
 import pandas as pd
 import zarr
 
-from spatialdata._io.spatial_index._build import write_points_spatial_index, write_spatial_index_attrs
+from spatialdata._io.spatial_index._build import write_points_spatial_index
+from spatialdata._io.spatial_index._sidecar import read_metadata, update_spatial_index, write_spatial_index
 from spatialdata._io.spatial_index._metadata import (
     P_COLUMN,
-    FeatureIndexLayout,
     LevelGrid,
     SpatialIndexMetadata,
     Storage,
@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "P_COLUMN",
+    "read_metadata",
+    "update_spatial_index",
     "LevelGrid",
     "PointsSpatialIndex",
     "ShapesSpatialIndex",
@@ -112,7 +114,7 @@ def write_points_with_spatial_index(
     transformations = _get_transformations(points)
     assert transformations is not None
     overwrite_coordinate_transformations_non_raster(group=group, axes=axes, transformations=transformations)
-    write_spatial_index_attrs(group, md)
+    write_spatial_index(path, md, stats.pop("parquet_sidecar", None))
     return md, stats
 
 
@@ -123,11 +125,11 @@ def build_points_spatial_index(
     new_element_name: str | None = None,
     storage: Storage = "parquet",
     axes: Sequence[str] | None = None,
+    tiled_axes: Sequence[str] | None = None,
     feature_keys: Sequence[str] | None = None,
     tile_size: float | Sequence[float] | None = None,
     target_points_per_tile: int = 10_000,
     n_levels: int | None = None,
-    feature_index: FeatureIndexLayout = "dense",
     seed: int = 0,
     **kwargs: Any,
 ) -> PointsSpatialIndex:
@@ -147,18 +149,18 @@ def build_points_spatial_index(
     storage
         ``"parquet"`` (default in RFC 3) or ``"zarr"`` (experimental in RFC 3).
     axes
-        Axes of the grid; default ``("x", "y")``: 2-D tiles also for 3-D points.
+        All the spatial axes of the element (the grid has all of them); default: ``x``, ``y`` and ``z`` if present.
+    tiled_axes
+        The axes with more than one tile; default ``("x", "y")``: a single tile along ``z`` (thin tissue).
     feature_keys
         Columns with a feature-major table; default: the element's feature key, if any. Pass ``[]`` for none.
     tile_size
-        Tile size of level 0; default: chosen so that the densest tile holds about ``target_points_per_tile``.
+        Tile size of level 0 along the tiled axes; default: chosen so that the median number of points of the
+        non-empty tiles is about ``target_points_per_tile``.
     target_points_per_tile
         See "Choosing the tile size and the rates" in RFC 3.
     n_levels
         Number of levels; default: merge until a single tile.
-    feature_index
-        ``"dense"`` (as in RFC 3: ``int64[n_features, N_tiles + 1]`` per band) or ``"sparse"`` (proposed fix: only
-        the non-empty tiles of each feature, CSR over features).
     seed
         Seed of the random priority p (ignored if the element already has ``__spatialdata_p__``).
     kwargs
@@ -183,11 +185,11 @@ def build_points_spatial_index(
         storage=storage,
         overwrite=True,
         axes=axes,
+        tiled_axes=tiled_axes,
         feature_keys=feature_keys,
         tile_size=tile_size,
         target_points_per_tile=target_points_per_tile,
         n_levels=n_levels,
-        feature_index=feature_index,
         seed=seed,
         **kwargs,
     )

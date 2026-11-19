@@ -52,8 +52,7 @@ def test_merge_rule_example():
 
 
 @pytest.mark.parametrize("storage", ["parquet", "zarr"])
-@pytest.mark.parametrize("feature_index", ["dense", "sparse"])
-def test_build_and_query(sdata_path, storage, feature_index):
+def test_build_and_query(sdata_path, storage):
     path, df = sdata_path
     sdata = read_zarr(path)
     index = build_points_spatial_index(
@@ -61,8 +60,8 @@ def test_build_and_query(sdata_path, storage, feature_index):
         "transcripts",
         storage=storage,
         target_points_per_tile=500,
-        feature_index=feature_index,
         rows_per_bucket=3_000,
+        row_group_min_rows=1_000,
         zarr_chunk_length=256,
     )
     md = index.metadata
@@ -75,13 +74,21 @@ def test_build_and_query(sdata_path, storage, feature_index):
     pts = sdata2["transcripts"].compute()
     assert len(pts) == len(df)
     assert P_COLUMN in pts.columns
-    assert pts[P_COLUMN].between(0, 1, inclusive="left").all()
+    assert pts[P_COLUMN].dtype == np.uint16 and md.p_bits == 16
+    assert md.axes == ("x", "y", "z") and md.levels[0].grid_shape[2] == 1  # all axes, a single tile along z
     attrs = zarr.open_group(path / "points" / "transcripts").attrs.asdict()
     assert attrs["spatialdata_attrs"]["version"] == {"parquet": "0.3", "zarr": "0.3-experimental"}[storage]
     assert "spatial_index" in attrs
+    # the same layout in both formats; Parquet adds the sidecar
+    element = path / "points" / "transcripts"
+    assert (element / "spatial" / "tile_offsets").exists() and (element / "feature" / "gene" / "tile_offsets").exists()
+    assert (element / "spatial_index.parquet.json").exists() == (storage == "parquet")
+    assert ("parquet" in attrs["spatial_index"]) == (storage == "parquet")
+    # offsets: the smallest integer type
+    assert zarr.open_array(element / "spatial" / "tile_offsets" / "0").dtype == np.int32
 
     # tile-major order: sorted by band (coarsest first), tile, p
-    band = md.band_of(pts[P_COLUMN].to_numpy())
+    band = md.band_of_k(pts[P_COLUMN].to_numpy())
     assert np.all(np.diff(-band) >= 0)
 
     # all points at level 0
@@ -97,12 +104,12 @@ def test_build_and_query(sdata_path, storage, feature_index):
     pts_box = pts[(pts.x >= lo[0]) & (pts.x <= hi[0]) & (pts.y >= lo[1]) & (pts.y <= hi[1])]
     for level in range(md.n_levels):
         ql = index.query(lo, hi, level=level)
-        expected = int((pts_box[P_COLUMN] < md.levels[level].P).sum())
+        expected = int((pts_box[P_COLUMN] < md.levels[level].P * 2**md.p_bits).sum())
         assert len(ql) == expected
 
     # budget
     qb = index.query(lo, hi, budget=0.1)
-    assert len(qb) == int((pts_box[P_COLUMN] < 0.1).sum())
+    assert len(qb) == int((pts_box[P_COLUMN] < 0.1 * 2**md.p_bits).sum())
 
     # feature-major and tile-major give the same points
     genes = ["g0", "g7", "g29"]
@@ -113,7 +120,7 @@ def test_build_and_query(sdata_path, storage, feature_index):
         a = a[key].sort_values(key).reset_index(drop=True)
         b = b[key].sort_values(key).reset_index(drop=True)
         pd.testing.assert_frame_equal(a, b, check_categorical=False)
-        expected = int(((pts_box[P_COLUMN] < md.levels[level].P) & pts_box.gene.isin(genes)).sum())
+        expected = int(((pts_box[P_COLUMN] < md.levels[level].P * 2**md.p_bits) & pts_box.gene.isin(genes)).sum())
         assert len(a) == expected
     # whole-dataset feature query (no box)
     a = index.query(features=["g3"])
@@ -130,4 +137,4 @@ def test_rebuild_keeps_p(sdata_path):
     p2 = np.sort(read_zarr(path)["transcripts"][P_COLUMN].compute().to_numpy())
     np.testing.assert_array_equal(p1, p2)
     index = read_points_spatial_index(path / "points" / "transcripts")
-    assert index.metadata.levels[0].tile_size == (37.0, 37.0)
+    assert index.metadata.levels[0].tile_size[:2] == (37.0, 37.0)

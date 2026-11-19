@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import zarr
 
-from spatialdata._io.spatial_index._metadata import P_COLUMN, SPATIAL_INDEX_KEY, SpatialIndexMetadata
+from spatialdata._io.spatial_index._metadata import P_COLUMN
 from spatialdata._io.spatial_index._zarr_df import read_zarr_df, zarr_df_columns, zarr_df_n_rows
 
 
@@ -42,12 +42,15 @@ def _natural_key(p: Path) -> list[Any]:
 class _ParquetTable:
     """Random access to rows of a (multi-file) Parquet table through its row groups.
 
-    If ``part_offsets`` (the first row of each part file, int64[n_files + 1]) is given, a file and its footer are
-    opened only when one of its rows is read; otherwise all the footers are read when the table is opened.
+    ``paths`` are the part files in order (a directory or a single file is listed and sorted naturally). If
+    ``part_offsets`` (the first row of each part file and the number of rows, as in the Parquet sidecar) is given, a
+    file and its footer are opened only when one of its rows is read; otherwise all the footers are read at once.
     """
 
-    def __init__(self, path: Path, part_offsets: np.ndarray | None = None) -> None:
-        self.paths = sorted(path.glob("*.parquet"), key=_natural_key) if path.is_dir() else [path]
+    def __init__(self, paths: Path | Sequence[Path], part_offsets: np.ndarray | None = None) -> None:
+        if isinstance(paths, Path):
+            paths = sorted(paths.glob("*.parquet"), key=_natural_key) if paths.is_dir() else [paths]
+        self.paths = list(paths)
         self._files: dict[int, pq.ParquetFile] = {}
         self._rg_start: dict[int, np.ndarray] = {}
         self.files_opened = 0
@@ -151,32 +154,37 @@ class PointsSpatialIndex:
     """
 
     def __init__(self, path: str | Path) -> None:
+        from spatialdata._io.spatial_index._sidecar import read_metadata
+
         self.path = Path(path)
         self.group = zarr.open_group(self.path, mode="r")
-        attrs = self.group.attrs.asdict()
-        if SPATIAL_INDEX_KEY not in attrs:
-            raise ValueError(f"{self.path} has no {SPATIAL_INDEX_KEY} metadata.")
-        self.metadata = SpatialIndexMetadata.from_dict(attrs[SPATIAL_INDEX_KEY])
-        self.storage: Literal["parquet", "zarr"] = "zarr" if "spatial" in self.group else "parquet"
+        self.metadata, self.parquet_sidecar = read_metadata(self.path)
+        self.storage: Literal["parquet", "zarr"] = "parquet" if self.parquet_sidecar is not None else "zarr"
         self._tables: dict[str | None, _ParquetTable | _ZarrTable] = {}
         self._offsets_cache: dict[tuple[str | None, int], Any] = {}
         self._categories: dict[str, list[str]] = {}
 
     # --- tables and offsets ---------------------------------------------------------------------------------------
+    @staticmethod
+    def _order_key(feature_key: str | None) -> str:
+        return "spatial" if feature_key is None else f"feature/{feature_key}"
+
     def _order_group(self, feature_key: str | None) -> zarr.Group:
-        if feature_key is None:
-            return self.group if self.storage == "parquet" else self.group["spatial"]
-        return self.group["feature"][feature_key]
+        g = self.group
+        for part in self._order_key(feature_key).split("/"):
+            g = g[part]
+        return g
 
     def table(self, feature_key: str | None = None) -> _ParquetTable | _ZarrTable:
         if feature_key not in self._tables:
-            og = self._order_group(feature_key)
             if self.storage == "parquet":
-                rel = "points.parquet" if feature_key is None else f"feature/{feature_key}/points.parquet"
-                po = og["part_offsets"][:] if "part_offsets" in og else None
-                self._tables[feature_key] = _ParquetTable(self.path / rel, po)
+                assert self.parquet_sidecar is not None
+                entry = self.parquet_sidecar["tables"][self._order_key(feature_key)]
+                self._tables[feature_key] = _ParquetTable(
+                    [self.path / f for f in entry["files"]], np.asarray(entry["first_row"], dtype=np.int64)
+                )
             else:
-                self._tables[feature_key] = _ZarrTable(og["points"])
+                self._tables[feature_key] = _ZarrTable(self._order_group(feature_key)["points"])
         return self._tables[feature_key]
 
     def _offsets(self, feature_key: str | None, level: int) -> Any:
@@ -192,27 +200,29 @@ class PointsSpatialIndex:
     def categories(self, feature_key: str) -> list[str]:
         """The global categories of a feature column (the codes of the feature index index this list)."""
         if feature_key not in self._categories:
-            fg = self.group.get("feature")
-            if fg is not None and feature_key in fg and "categories" in fg[feature_key]:
-                self._categories[feature_key] = [str(v) for v in fg[feature_key]["categories"][:]]
+            entry = None
+            if self.parquet_sidecar is not None:
+                entry = self.parquet_sidecar["tables"].get(self._order_key(feature_key))
+            if entry is not None and "categories" in entry:
+                self._categories[feature_key] = [str(v) for v in entry["categories"]]
             else:
                 t = self.table(feature_key if feature_key in self.metadata.feature_keys else None)
                 self._categories[feature_key] = t.categories(feature_key)
         return self._categories[feature_key]
 
-    @property
-    def feature_index_layout(self) -> str:
-        return str(self.metadata.extra.get("feature_index_layout", "dense"))
-
     # --- row ranges -----------------------------------------------------------------------------------------------
     def _box(self, box_min: Sequence[float] | None, box_max: Sequence[float] | None) -> tuple[np.ndarray, np.ndarray]:
+        """The box in the order of ``axes``; missing trailing axes (e.g. z for a 2-D box) span the whole grid."""
         lv0 = self.metadata.levels[0]
-        lo = np.asarray(lv0.origin, np.float64) if box_min is None else np.asarray(box_min, np.float64)
-        hi = (
-            np.asarray(lv0.origin) + np.asarray(lv0.tile_size) * np.asarray(lv0.grid_shape)
-            if box_max is None
-            else np.asarray(box_max, np.float64)
-        )
+        full_lo = np.asarray(lv0.origin, np.float64)
+        full_hi = full_lo + np.asarray(lv0.tile_size) * np.asarray(lv0.grid_shape)
+        lo, hi = full_lo.copy(), full_hi.copy()
+        if box_min is not None:
+            bm = np.asarray(box_min, np.float64)
+            lo[: len(bm)] = bm
+        if box_max is not None:
+            bM = np.asarray(box_max, np.float64)
+            hi[: len(bM)] = bM
         return lo, hi
 
     def tile_ranges(
@@ -226,7 +236,7 @@ class PointsSpatialIndex:
             if len(tiles) == 0:
                 continue
             O = self._offsets(None, band)
-            o = O.get_coordinate_selection(np.concatenate([tiles, tiles + 1]))
+            o = O.get_coordinate_selection(np.concatenate([tiles, tiles + 1])).astype(np.int64)
             starts.append(o[: len(tiles)])
             stops.append(o[len(tiles) :])
         if not starts:
@@ -248,7 +258,7 @@ class PointsSpatialIndex:
             tiles = grid.tiles_in_box(lo, hi)
             if len(tiles) == 0:
                 continue
-            o = self._offsets(None, band).get_coordinate_selection(np.concatenate([tiles, tiles + 1]))
+            o = self._offsets(None, band).get_coordinate_selection(np.concatenate([tiles, tiles + 1])).astype(np.int64)
             n = (o[len(tiles) :] - o[: len(tiles)]).astype(np.float64)
             t = np.stack(np.unravel_index(tiles, grid.grid_shape), axis=1).astype(np.float64)
             tmin = np.asarray(grid.origin) + t * np.asarray(grid.tile_size)
@@ -272,46 +282,29 @@ class PointsSpatialIndex:
         full_view = box_min is None and box_max is None
         for band in range(self.metadata.L, level - 1, -1):
             O = self._offsets(feature_key, band)
+            ptr = O["feature_ptr"]
+            ro = O["row_offsets"]
+            p0 = ptr.get_coordinate_selection(codes).astype(np.int64)
+            p1 = ptr.get_coordinate_selection(codes + 1).astype(np.int64)
             if full_view:
-                # whole (feature, band) ranges
-                if isinstance(O, zarr.Array):
-                    n_t = O.shape[1] - 1
-                    a = O.get_coordinate_selection((codes, np.zeros_like(codes)))
-                    b = O.get_coordinate_selection((codes, np.full_like(codes, n_t)))
-                else:
-                    ptr = O["feature_ptr"]
-                    ro = O["row_offsets"]
-                    p0 = ptr.get_coordinate_selection(codes)
-                    p1 = ptr.get_coordinate_selection(codes + 1)
-                    a = ro.get_coordinate_selection(p0 + codes)
-                    b = ro.get_coordinate_selection(p1 + codes)
-                starts.append(a)
-                stops.append(b)
+                # whole (feature, band) ranges: from the first entry to the end entry of each feature
+                starts.append(ro.get_coordinate_selection(p0 + codes).astype(np.int64))
+                stops.append(ro.get_coordinate_selection(p1 + codes).astype(np.int64))
                 continue
             tiles = self.metadata.levels[band].tiles_in_box(lo, hi)
             if len(tiles) == 0:
                 continue
-            if isinstance(O, zarr.Array):
-                rows = np.repeat(codes, len(tiles))
-                cols = np.tile(tiles, len(codes))
-                starts.append(O.get_coordinate_selection((rows, cols)))
-                stops.append(O.get_coordinate_selection((rows, cols + 1)))
-            else:
-                ptr = O["feature_ptr"]
-                tile_ids = O["tile_ids"]
-                ro = O["row_offsets"]
-                p0 = ptr.get_coordinate_selection(codes)
-                p1 = ptr.get_coordinate_selection(codes + 1)
-                for c, a, b in zip(codes, p0, p1, strict=True):
-                    if b == a:
-                        continue
-                    t = tile_ids[int(a) : int(b)]
-                    hit = np.flatnonzero(np.isin(t, tiles, assume_unique=True))
-                    if len(hit) == 0:
-                        continue
-                    offs = ro[int(a + c) : int(b + c) + 1]
-                    starts.append(offs[hit])
-                    stops.append(offs[hit + 1])
+            tile_ids = O["tile_ids"]
+            for c, a, b in zip(codes, p0, p1, strict=True):
+                if b == a:
+                    continue
+                t = tile_ids[int(a) : int(b)]
+                hit = np.flatnonzero(np.isin(t, tiles, assume_unique=True))
+                if len(hit) == 0:
+                    continue
+                offs = ro[int(a + c) : int(b + c) + 1].astype(np.int64)
+                starts.append(offs[hit])
+                stops.append(offs[hit + 1])
         if not starts:
             return np.empty(0, np.int64), np.empty(0, np.int64)
         return np.concatenate(starts), np.concatenate(stops)
@@ -373,7 +366,8 @@ class PointsSpatialIndex:
         df = data.to_pandas() if isinstance(data, pa.Table) else data
         mask = np.ones(len(df), dtype=bool)
         if budget is not None:
-            mask &= df[P_COLUMN].to_numpy() < budget
+            # p = k / 2**p_bits < budget
+            mask &= df[P_COLUMN].to_numpy().astype(np.float64) < budget * 2.0**md.p_bits
         if features is not None and not use_feature_index:
             mask &= df[feature_key].isin(list(features)).to_numpy()
         if exact and (box_min is not None or box_max is not None):

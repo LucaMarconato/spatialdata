@@ -16,7 +16,7 @@ import shutil
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import geopandas as gpd
 import numpy as np
@@ -293,22 +293,45 @@ def build_shapes_spatial_index(
 class ShapesSpatialIndex:
     """Read shapes (and the rows of their table) by region through the spatial index of RFC 4."""
 
-    def __init__(self, path: str | Path, table_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        table_path: str | Path | None = None,
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
+        from spatialdata._io.spatial_index._read import _resolve
         from spatialdata._io.spatial_index._sidecar import read_metadata
 
-        self.path = Path(path)
-        g = zarr.open_group(self.path, mode="r")
-        self.metadata, sidecar = read_metadata(self.path)
+        self.url, self.fs = _resolve(path, storage_options)
+        self.storage_options = storage_options
+        self.path = Path(path) if self.fs is None else None
+        g = self._open(self.url)
+        self.metadata, sidecar = read_metadata(self.url, self.fs)
         self.margin = np.asarray(self.metadata.margin or (0.0, 0.0), dtype=np.float64)
         self.offsets = g["spatial"]["tile_offsets"]["0"]
         assert sidecar is not None
         entry = sidecar["tables"]["spatial"]
-        self.table = _ParquetTable([self.path / f for f in entry["files"]], np.asarray(entry["first_row"]))
+        files = [f"{self.url}/{f}" for f in entry["files"]]
+        self.table = _ParquetTable(
+            [Path(f) for f in files] if self.fs is None else files, np.asarray(entry["first_row"]), self.fs
+        )
         if table_path is None and self.metadata.table is not None:
-            candidate = self.path.parent.parent / "tables" / self.metadata.table
-            table_path = candidate if candidate.exists() else None
-        self.table_path = Path(table_path) if table_path is not None else None
+            table_path = f"{self.url.rsplit('/', 2)[0]}/tables/{self.metadata.table}"
+        self.table_path = str(table_path) if table_path is not None else None
         self._var_names: list[str] | None = None
+        self._table_group: Any = None
+
+    def _open(self, url: str) -> zarr.Group:
+        if self.fs is None:
+            return zarr.open_group(Path(url), mode="r")
+        return zarr.open_group(url, mode="r", storage_options=self.storage_options)
+
+    @property
+    def table_group(self) -> zarr.Group:
+        assert self.table_path is not None
+        if self._table_group is None:
+            self._table_group = self._open(self.table_path)
+        return self._table_group
 
     def row_ranges(self, box_min: Sequence[float], box_max: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
         lo = np.asarray(box_min, np.float64) - self.margin
@@ -347,15 +370,13 @@ class ShapesSpatialIndex:
             assert self.table_path is not None
             import anndata
 
-            var = anndata.io.read_elem(zarr.open_group(self.table_path, mode="r")["var"])
+            var = anndata.io.read_elem(self.table_group["var"])
             self._var_names = list(var.index)
         return self._var_names
 
     def gene_values(self, gene: str, rows: np.ndarray | None = None, layer: str = CSC_LAYER) -> np.ndarray:
         """Values of one gene for the given rows (default: all), from the CSC layer: one column read."""
-        assert self.table_path is not None
-        g = zarr.open_group(self.table_path, mode="r")
-        m = g["layers"][layer]
+        m = self.table_group["layers"][layer]
         n_obs = int(m.attrs["shape"][0])
         j = self.var_names.index(gene)
         a, b = (int(v) for v in m["indptr"][j : j + 2])
@@ -367,8 +388,7 @@ class ShapesSpatialIndex:
 
     def table_rows(self, rows: np.ndarray, layer: str | None = None) -> sparse.csr_matrix:
         """Rows of the CSR matrix X (or a CSR layer) for the given rows of the shapes (table aligned to shapes)."""
-        assert self.table_path is not None
-        g = zarr.open_group(self.table_path, mode="r")
+        g = self.table_group
         m = g["X"] if layer is None else g["layers"][layer]
         indptr = m["indptr"][:]
         n_vars = int(m.attrs["shape"][1])

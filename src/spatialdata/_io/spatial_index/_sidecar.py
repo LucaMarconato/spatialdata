@@ -46,15 +46,25 @@ def update_spatial_index(element_path: Path, **changes: Any) -> SpatialIndexMeta
     return md
 
 
-def read_metadata(element_path: Path) -> tuple[SpatialIndexMetadata, dict[str, Any] | None]:
-    """The index metadata (read as plain JSON) and the Parquet sidecar (``None`` for the Zarr format)."""
-    element_path = Path(element_path)
-    zj = element_path / "zarr.json"
-    attrs = json.loads(zj.read_text()).get("attributes", {}) if zj.exists() else {}
+def read_metadata(element_path: str | Path, fs: Any = None) -> tuple[SpatialIndexMetadata, dict[str, Any] | None]:
+    """The index metadata (read as plain JSON) and the Parquet sidecar (``None`` for the Zarr format).
+
+    ``fs``: an fsspec filesystem for a remote element (``element_path`` is then its URL).
+    """
+
+    def read_json(rel: str) -> Any:
+        if fs is None:
+            p = Path(element_path) / rel
+            return json.loads(p.read_text()) if p.exists() else None
+        try:
+            return json.loads(fs.cat_file(f"{str(element_path).rstrip('/')}/{rel}"))
+        except FileNotFoundError:
+            return None
+
+    zj = read_json("zarr.json") or {}
+    attrs = zj.get("attributes", {})
     if SPATIAL_INDEX_KEY not in attrs:
         raise ValueError(f"{element_path} has no {SPATIAL_INDEX_KEY} metadata.")
     md = SpatialIndexMetadata.from_dict(attrs[SPATIAL_INDEX_KEY])
-    sidecar = None
-    if md.parquet is not None:
-        sidecar = json.loads((element_path / md.parquet).read_text())
+    sidecar = read_json(md.parquet) if md.parquet is not None else None
     return md, sidecar

@@ -47,10 +47,13 @@ class _ParquetTable:
     file and its footer are opened only when one of its rows is read; otherwise all the footers are read at once.
     """
 
-    def __init__(self, paths: Path | Sequence[Path], part_offsets: np.ndarray | None = None) -> None:
+    def __init__(
+        self, paths: Path | Sequence[Path | str], part_offsets: np.ndarray | None = None, fs: Any = None
+    ) -> None:
         if isinstance(paths, Path):
             paths = sorted(paths.glob("*.parquet"), key=_natural_key) if paths.is_dir() else [paths]
         self.paths = list(paths)
+        self.fs = fs  # fsspec filesystem for remote files (None: local paths)
         self._files: dict[int, pq.ParquetFile] = {}
         self._rg_start: dict[int, np.ndarray] = {}
         self.files_opened = 0
@@ -65,7 +68,8 @@ class _ParquetTable:
 
     def _file(self, i: int) -> pq.ParquetFile:
         if i not in self._files:
-            f = pq.ParquetFile(self.paths[i])
+            src = self.paths[i] if self.fs is None else self.fs.open(str(self.paths[i]), "rb")
+            f = pq.ParquetFile(src)
             self._files[i] = f
             rows = [f.metadata.row_group(r).num_rows for r in range(f.metadata.num_row_groups)]
             self._rg_start[i] = np.concatenate([[0], np.cumsum(rows)]).astype(np.int64)
@@ -153,12 +157,17 @@ class PointsSpatialIndex:
         Path of the points element group (``.../points/<name>``).
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, storage_options: dict[str, Any] | None = None) -> None:
         from spatialdata._io.spatial_index._sidecar import read_metadata
 
-        self.path = Path(path)
-        self.group = zarr.open_group(self.path, mode="r")
-        self.metadata, self.parquet_sidecar = read_metadata(self.path)
+        self.url, self.fs = _resolve(path, storage_options)
+        self.path = Path(path) if self.fs is None else None
+        self.group = (
+            zarr.open_group(self.path, mode="r")
+            if self.fs is None
+            else zarr.open_group(self.url, mode="r", storage_options=storage_options)
+        )
+        self.metadata, self.parquet_sidecar = read_metadata(self.url, self.fs)
         self.storage: Literal["parquet", "zarr"] = "parquet" if self.parquet_sidecar is not None else "zarr"
         self._tables: dict[str | None, _ParquetTable | _ZarrTable] = {}
         self._offsets_cache: dict[tuple[str | None, int], Any] = {}
@@ -180,9 +189,8 @@ class PointsSpatialIndex:
             if self.storage == "parquet":
                 assert self.parquet_sidecar is not None
                 entry = self.parquet_sidecar["tables"][self._order_key(feature_key)]
-                self._tables[feature_key] = _ParquetTable(
-                    [self.path / f for f in entry["files"]], np.asarray(entry["first_row"], dtype=np.int64)
-                )
+                files = [self.path / f for f in entry["files"]] if self.fs is None else [f"{self.url}/{f}" for f in entry["files"]]
+                self._tables[feature_key] = _ParquetTable(files, np.asarray(entry["first_row"], dtype=np.int64), self.fs)
             else:
                 self._tables[feature_key] = _ZarrTable(self._order_group(feature_key)["points"])
         return self._tables[feature_key]
@@ -382,6 +390,17 @@ class PointsSpatialIndex:
         return df[cols].reset_index(drop=True)
 
 
-def read_points_spatial_index(path: str | Path) -> PointsSpatialIndex:
-    """Open the spatial index (RFC 3) of a points element stored at ``path``."""
-    return PointsSpatialIndex(path)
+def _resolve(path: str | Path, storage_options: dict[str, Any] | None) -> tuple[str, Any]:
+    """(url without trailing slash, fsspec filesystem or None for a local path)."""
+    s = str(path).rstrip("/")
+    if "://" in s and not s.startswith("file://"):
+        import fsspec
+
+        fs, _ = fsspec.core.url_to_fs(s, **(storage_options or {}))
+        return s, fs
+    return s.removeprefix("file://"), None
+
+
+def read_points_spatial_index(path: str | Path, storage_options: dict[str, Any] | None = None) -> PointsSpatialIndex:
+    """Open the spatial index (RFC 3) of a points element at ``path`` (local, or a URL such as ``s3://...``)."""
+    return PointsSpatialIndex(path, storage_options)

@@ -38,7 +38,7 @@ import numpy as np
 import spatialdata as sd
 from spatialdata._io.spatial_index import PointsSpatialIndex, write_points_with_spatial_index
 
-DATA = Path("/Users/macbook/embl/projects/basel/tiled-index-data")
+DATA = Path("/Volumes/Scratch/tiled-index-data")
 SOURCE = DATA / "spatialdata_db_atera_kidney.zarr"  # points, shapes and table downloaded from spatialdata-db
 OUT = DATA / "kidney.zarr"
 """),
@@ -210,7 +210,7 @@ import zarr
 import spatialdata as sd
 from spatialdata._io.spatial_index import PointsSpatialIndex, ShapesSpatialIndex, build_shapes_spatial_index
 
-DATA = Path("/Users/macbook/embl/projects/basel/tiled-index-data")
+DATA = Path("/Volumes/Scratch/tiled-index-data")
 OUT = DATA / "kidney.zarr"
 sdata = sd.read_zarr(OUT)
 sdata

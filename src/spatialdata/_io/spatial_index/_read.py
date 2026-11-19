@@ -68,8 +68,13 @@ class _ParquetTable:
 
     def _file(self, i: int) -> pq.ParquetFile:
         if i not in self._files:
-            src = self.paths[i] if self.fs is None else self.fs.open(str(self.paths[i]), "rb")
-            f = pq.ParquetFile(src)
+            if self.fs is None:
+                f = pq.ParquetFile(self.paths[i])
+            else:
+                # remote: byte-range reads of the footer and of the column chunks a query needs (an fsspec file object
+                # would read ahead whole blocks of tens of MB)
+                handle = self.fs.open(str(self.paths[i]), "rb", cache_type="none")
+                f = pq.ParquetFile(handle)
             self._files[i] = f
             rows = [f.metadata.row_group(r).num_rows for r in range(f.metadata.num_row_groups)]
             self._rg_start[i] = np.concatenate([[0], np.cumsum(rows)]).astype(np.int64)

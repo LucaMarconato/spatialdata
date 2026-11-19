@@ -40,7 +40,7 @@ from spatialdata._io.spatial_index import PointsSpatialIndex, write_points_with_
 
 DATA = Path("/Users/macbook/embl/projects/basel/tiled-index-data")
 SOURCE = DATA / "spatialdata_db_atera_kidney.zarr"  # points, shapes and table downloaded from spatialdata-db
-OUT = DATA / "kidney_tiled.zarr"
+OUT = DATA / "kidney.zarr"
 """),
     md("## The SpatialData object as distributed"),
     code("""
@@ -82,7 +82,7 @@ stats_by_storage = {}
 for storage in ["parquet", "zarr"]:
     name = f"transcripts_{storage}"
     path = OUT / "points" / name
-    if not (path / "zarr.json").exists():
+    if not (path / "zarr.json").exists() or "spatial_index" not in (path / "zarr.json").read_text():
         t0 = time.time()
         md, stats = write_points_with_spatial_index(
             points, path, storage=storage, tmp_dir=DATA / "tmp", n_workers=6
@@ -211,7 +211,7 @@ import spatialdata as sd
 from spatialdata._io.spatial_index import PointsSpatialIndex, ShapesSpatialIndex, build_shapes_spatial_index
 
 DATA = Path("/Users/macbook/embl/projects/basel/tiled-index-data")
-OUT = DATA / "kidney_tiled.zarr"
+OUT = DATA / "kidney.zarr"
 sdata = sd.read_zarr(OUT)
 sdata
 """),

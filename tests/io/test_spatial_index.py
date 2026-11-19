@@ -138,3 +138,14 @@ def test_rebuild_keeps_p(sdata_path):
     np.testing.assert_array_equal(p1, p2)
     index = read_points_spatial_index(path / "points" / "transcripts")
     assert index.metadata.levels[0].tile_size[:2] == (37.0, 37.0)
+
+
+def test_band_boundaries():
+    # p = P(l) exactly is NOT in level l (level l holds p < P(l))
+    lv0 = LevelGrid((0.0, 0.0), (1.0, 1.0), (4, 4), 1.0)
+    md = SpatialIndexMetadata(axes=("x", "y"), levels=tuple(merge_rule(lv0)), p_bits=16)
+    t = md.thresholds()  # 65536, 16384, 4096
+    k = np.array([0, 4095, 4096, 16383, 16384, 65535])
+    np.testing.assert_array_equal(md.band_of_k(k), [2, 2, 1, 1, 0, 0])
+    np.testing.assert_array_equal(md.band_of(k / 2**16), [2, 2, 1, 1, 0, 0])
+    assert t[1] == 16384

@@ -189,13 +189,13 @@ class SpatialIndexMetadata:
     def band_of_k(self, k: np.ndarray) -> np.ndarray:
         """Band of each p = k / 2**p_bits: the largest l with k < P(l) * 2**p_bits."""
         t = self.thresholds()
-        return (np.searchsorted(-t, -np.asarray(k, dtype=np.float64), side="right") - 1).astype(np.int64)
+        return (np.searchsorted(-t, -np.asarray(k, dtype=np.float64), side="left") - 1).astype(np.int64)
 
     def band_of(self, p: np.ndarray) -> np.ndarray:
         """Band of each p: the largest l with p < P(l)."""
         Ps = np.asarray([lvl.P for lvl in self.levels], dtype=np.float64)
         # number of levels with p < P(l), minus 1 (P(0) = 1 > p always)
-        return (np.searchsorted(-Ps, -np.asarray(p, dtype=np.float64), side="right") - 1).astype(np.int64)
+        return (np.searchsorted(-Ps, -np.asarray(p, dtype=np.float64), side="left") - 1).astype(np.int64)
 
     def coarsest_level_for_budget(self, b: float) -> int:
         """The coarsest level l with P(l) >= b (see "Reading with a budget")."""

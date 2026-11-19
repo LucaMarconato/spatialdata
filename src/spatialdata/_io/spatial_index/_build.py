@@ -279,7 +279,13 @@ def _plan(
             raise ValueError(f"P must have one entry per level ({len(levels)}), got {len(P)}.")
         levels = [LevelGrid(lv.origin, lv.tile_size, lv.grid_shape, float(p)) for lv, p in zip(levels, P, strict=True)]
     if p_bits is None:
-        p_bits = max(DEFAULT_P_BITS, min_p_bits(levels[-1].P))
+        if n_levels is None and P is None:
+            # default: keep p in 16 bits and stop the merge rule at the coarsest level that 16 bits can represent
+            # (P(L) >= 2**(4 - 16)); the remaining levels hold a few tiles each, enough for an overview
+            levels = [lv for lv in levels if lv.P >= 2.0 ** (4 - DEFAULT_P_BITS)]
+            p_bits = DEFAULT_P_BITS
+        else:
+            p_bits = max(DEFAULT_P_BITS, min_p_bits(levels[-1].P))
     md = SpatialIndexMetadata(
         axes=tuple(axes),
         levels=tuple(levels),

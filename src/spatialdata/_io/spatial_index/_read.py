@@ -252,6 +252,7 @@ class PointsSpatialIndex:
         the large tiles of the coarse bands.
         """
         lo, hi = self._box(box_min, box_max)
+        full_lo, full_hi = self._box(None, None)
         total = 0.0
         for band in range(self.metadata.L, level - 1, -1):
             grid = self.metadata.levels[band]
@@ -261,10 +262,12 @@ class PointsSpatialIndex:
             o = self._offsets(None, band).get_coordinate_selection(np.concatenate([tiles, tiles + 1])).astype(np.int64)
             n = (o[len(tiles) :] - o[: len(tiles)]).astype(np.float64)
             t = np.stack(np.unravel_index(tiles, grid.grid_shape), axis=1).astype(np.float64)
-            tmin = np.asarray(grid.origin) + t * np.asarray(grid.tile_size)
-            tmax = tmin + np.asarray(grid.tile_size)
-            overlap = np.clip(np.minimum(tmax, hi) - np.maximum(tmin, lo), 0, None) / np.asarray(grid.tile_size)
-            total += float(np.sum(n * np.prod(overlap, axis=1)))
+            # the part of each tile inside the grid of level 0 (coarse tiles may extend beyond the data)
+            tmin = np.maximum(np.asarray(grid.origin) + t * np.asarray(grid.tile_size), full_lo)
+            tmax = np.minimum(np.asarray(grid.origin) + (t + 1) * np.asarray(grid.tile_size), full_hi)
+            size = np.maximum(tmax - tmin, 1e-12)
+            overlap = np.clip(np.minimum(tmax, hi) - np.maximum(tmin, lo), 0, None) / size
+            total += float(np.sum(n * np.prod(np.minimum(overlap, 1.0), axis=1)))
         return total
 
     def feature_ranges(
